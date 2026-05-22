@@ -31,6 +31,7 @@ class RequestLog(Base):
     request_id: Mapped[str] = mapped_column(String(64), nullable=False)
     api_key_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     api_key_label: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    api_key_preview: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     upstream_key_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     upstream_key_preview: Mapped[str | None] = mapped_column(String(32), nullable=True)

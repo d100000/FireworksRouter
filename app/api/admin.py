@@ -9,6 +9,7 @@ from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import SessionDep, require_admin
+from app.crypto import decrypt_key, encrypt_key
 from app.models import (
     ApiKey,
     ApiKeyStatus,
@@ -260,6 +261,7 @@ class ApiKeyOut(BaseModel):
     label: str
     note: str | None
     token_preview: str
+    can_reveal: bool = False  # 是否可以直接复制完整 token（v4 之前的旧 key 为 False）
     status: str
     expires_at: datetime | None
     unlimited_quota: bool
@@ -280,7 +282,8 @@ class ApiKeyOut(BaseModel):
     def from_orm(cls, t: ApiKey) -> "ApiKeyOut":
         return cls(
             id=t.id, label=t.label, note=t.note,
-            token_preview=t.token_preview, status=t.status.value,
+            token_preview=t.token_preview, can_reveal=t.token_encrypted is not None,
+            status=t.status.value,
             expires_at=t.expires_at, unlimited_quota=t.unlimited_quota,
             remaining_quota_usd=t.remaining_quota_usd, used_quota_usd=t.used_quota_usd,
             allowed_models=t.allowed_models, allowed_ips=t.allowed_ips,
@@ -336,6 +339,7 @@ async def create_api_key(payload: ApiKeyCreate, session: SessionDep):
         label=payload.label, note=payload.note,
         token_hash=hash_token(token),
         token_preview=f"{token[:10]}...{token[-4:]}",
+        token_encrypted=encrypt_key(token),  # Fernet 加密存明文，后续可复制
         status=ApiKeyStatus.active,
         expires_at=payload.expires_at,
         unlimited_quota=payload.unlimited_quota,
@@ -384,10 +388,29 @@ async def rotate_api_key(key_id: int, session: SessionDep):
     new_token = generate_user_token()
     record.token_hash = hash_token(new_token)
     record.token_preview = f"{new_token[:10]}...{new_token[-4:]}"
+    record.token_encrypted = encrypt_key(new_token)
     await session.flush()
     out = ApiKeyOut.from_orm(record).model_dump()
     out["token"] = new_token
     return ApiKeyCreated(**out)
+
+
+@router.get("/api-keys/{key_id}/reveal")
+async def reveal_api_key(key_id: int, session: SessionDep) -> dict:
+    """返回明文 token（仅 v4 之后创建/旋转过的 Key 有密文可解）。"""
+    record = await session.get(ApiKey, key_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="not found")
+    if record.token_encrypted is None:
+        raise HTTPException(
+            status_code=410,
+            detail={"error": {"message": "Token not retrievable (created before v4). Rotate to get a new copyable token.", "type": "not_retrievable"}},
+        )
+    try:
+        plaintext = decrypt_key(record.token_encrypted)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"decrypt failed: {e}") from None
+    return {"token": plaintext, "preview": record.token_preview}
 
 
 # ============================= Logs / Stats =============================
@@ -415,6 +438,7 @@ async def list_request_logs(
             {
                 "id": r.id, "request_id": r.request_id,
                 "api_key_id": r.api_key_id, "api_key_label": r.api_key_label,
+                "api_key_preview": r.api_key_preview,
                 "upstream_key_id": r.upstream_key_id,
                 "upstream_key_preview": r.upstream_key_preview,
                 "public_model": r.public_model, "endpoint": r.endpoint, "stream": r.stream,

@@ -122,6 +122,7 @@ async def _persist_log(
         upstream_key_preview = upstream_key.key_preview if upstream_key else None
         api_key_id = api_key.id if api_key else None
         api_key_label = api_key.label if api_key else None
+        api_key_preview = api_key.token_preview if api_key else None
 
         db_model = await session.get(Model, model_record.id) if model_record else None
         raw_cost = 0.0
@@ -166,6 +167,7 @@ async def _persist_log(
             RequestLog(
                 request_id=request_id,
                 api_key_id=api_key_id, api_key_label=api_key_label,
+                api_key_preview=api_key_preview,
                 upstream_key_id=upstream_key_id, upstream_key_preview=upstream_key_preview,
                 model_id=db_model.id if db_model else None,
                 public_model=public_model, upstream_model=upstream_model,

@@ -24,6 +24,42 @@ router = APIRouter(
 )
 
 
+@router.get("/upstream-keys/{key_id}/recent-requests")
+async def key_recent_requests(
+    key_id: int,
+    session: SessionDep,
+    limit: int = Query(50, ge=1, le=500),
+) -> dict[str, Any]:
+    """该 Key 最近 N 条调用明细（含 endpoint / api_key 名称首字 / 流式 / 耗时）。"""
+    stmt = (
+        select(RequestLog)
+        .where(RequestLog.upstream_key_id == key_id)
+        .order_by(desc(RequestLog.id))
+        .limit(limit)
+    )
+    rows = list((await session.execute(stmt)).scalars().all())
+    return {
+        "key_id": key_id,
+        "items": [
+            {
+                "id": r.id, "created_at": r.created_at,
+                "api_key_label": r.api_key_label,
+                "api_key_preview": r.api_key_preview,
+                "endpoint": r.endpoint,
+                "public_model": r.public_model,
+                "stream": r.stream,
+                "status_code": r.status_code,
+                "prompt_tokens": r.prompt_tokens,
+                "completion_tokens": r.completion_tokens,
+                "latency_ms": r.latency_ms,
+                "ttft_ms": r.ttft_ms,
+                "billed_cost_usd": r.billed_cost_usd,
+            }
+            for r in rows
+        ],
+    }
+
+
 @router.get("/upstream-keys/{key_id}/metrics")
 async def key_metrics(
     key_id: int,

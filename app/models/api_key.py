@@ -11,6 +11,7 @@ from sqlalchemy import (
     Float,
     Index,
     Integer,
+    LargeBinary,
     String,
     func,
 )
@@ -41,6 +42,9 @@ class ApiKey(Base):
 
     token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
     token_preview: Mapped[str] = mapped_column(String(32), nullable=False)
+    # Fernet 加密存放的明文 token；启用后用户可以在 UI 上按下「复制」直接拿完整 token
+    # 老数据（v4 迁移前的 token）此字段为 NULL，需要 rotate 后才能复制
+    token_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
 
     status: Mapped[ApiKeyStatus] = mapped_column(
         SAEnum(ApiKeyStatus, native_enum=False, length=32),

@@ -28,6 +28,7 @@ export const apiKeysApi = {
   update: (id, data) => api.patch(`/admin/api-keys/${id}`, data),
   delete: (id) => api.delete(`/admin/api-keys/${id}`),
   rotate: (id) => api.post(`/admin/api-keys/${id}/rotate`),
+  reveal: (id) => api.get(`/admin/api-keys/${id}/reveal`),
 }
 
 export const modelApi = {

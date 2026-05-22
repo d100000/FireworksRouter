@@ -43,7 +43,7 @@
       <n-input :value="createdToken" readonly type="textarea" :autosize="{ minRows: 2 }" />
       <template #footer>
         <n-space justify="end">
-          <n-button type="primary" @click="copyToken">复制</n-button>
+          <n-button type="primary" @click="copyCreatedToken">复制</n-button>
           <n-button @click="createdShow = false">关闭</n-button>
         </n-space>
       </template>
@@ -94,8 +94,12 @@ const columns = [
   },
   { title: '最后使用', key: 'last_used_at', width: 170 },
   {
-    title: '操作', key: 'actions', width: 220, fixed: 'right',
+    title: '操作', key: 'actions', width: 280, fixed: 'right',
     render: (row) => h(NSpace, { size: 'small' }, () => [
+      // 复制完整 token（v4 之前的旧 key 无法直接复制，需要先 rotate）
+      row.can_reveal
+        ? h(NButton, { size: 'tiny', type: 'primary', ghost: true, onClick: () => copyToken(row.id) }, () => '复制')
+        : h(NButton, { size: 'tiny', disabled: true, title: '旧 Key 无密文，请旋转后再复制' }, () => '复制(需旋转)'),
       h(NButton, {
         size: 'tiny', type: row.status === 'active' ? 'warning' : 'primary',
         onClick: () => toggleStatus(row),
@@ -149,6 +153,16 @@ async function toggleStatus(row) {
   await load()
 }
 
+async function copyToken(id) {
+  try {
+    const { data } = await apiKeysApi.reveal(id)
+    await navigator.clipboard.writeText(data.token)
+    message.success(`已复制 ${data.preview} 到剪贴板`)
+  } catch (e) {
+    message.error(e?.response?.data?.detail?.error?.message || '复制失败')
+  }
+}
+
 async function rotate(id) {
   const { data } = await apiKeysApi.rotate(id)
   createdToken.value = data.token
@@ -161,7 +175,7 @@ async function remove(id) {
   await load()
 }
 
-function copyToken() {
+function copyCreatedToken() {
   navigator.clipboard.writeText(createdToken.value)
   message.success('已复制')
 }
