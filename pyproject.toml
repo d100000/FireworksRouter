@@ -1,0 +1,18 @@
+[project]
+name = "fireworkrouter"
+version = "0.1.0"
+description = "OpenAI-compatible router for Fireworks.ai with multi-key pool & balance auto-disable"
+requires-python = ">=3.11"
+readme = "README.md"
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "ASYNC", "S", "RUF"]
+ignore = ["S101", "S105", "S106", "E501"]
+
+[tool.pyright]
+typeCheckingMode = "basic"
+pythonVersion = "3.11"

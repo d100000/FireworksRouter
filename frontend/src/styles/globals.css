@@ -1,0 +1,160 @@
+/* ========== 全局视觉风格：参考 sub2api 的 Teal + Glass + Mesh 设计语言 ========== */
+
+:root {
+  /* Teal 主色阶 */
+  --fwr-primary-50: #f0fdfa;
+  --fwr-primary-100: #ccfbf1;
+  --fwr-primary-200: #99f6e4;
+  --fwr-primary-300: #5eead4;
+  --fwr-primary-400: #2dd4bf;
+  --fwr-primary-500: #14b8a6;
+  --fwr-primary-600: #0d9488;
+  --fwr-primary-700: #0f766e;
+  --fwr-primary-800: #115e59;
+  --fwr-primary-900: #134e4a;
+  --fwr-primary-950: #042f2e;
+
+  /* 中性色（slate 系） */
+  --fwr-dark-50: #f8fafc;
+  --fwr-dark-100: #f1f5f9;
+  --fwr-dark-200: #e2e8f0;
+  --fwr-dark-700: #334155;
+  --fwr-dark-800: #1e293b;
+  --fwr-dark-900: #0f172a;
+  --fwr-dark-950: #020617;
+
+  --fwr-success: #22c55e;
+  --fwr-warning: #f59e0b;
+  --fwr-danger: #ef4444;
+  --fwr-info: #3b82f6;
+}
+
+html, body, #app {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  font-family: system-ui, -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ========== Mesh Gradient 背景（登录页用） ========== */
+.fwr-mesh-bg {
+  position: relative;
+  background:
+    radial-gradient(at 20% 20%, rgba(20, 184, 166, 0.18) 0px, transparent 50%),
+    radial-gradient(at 80% 30%, rgba(13, 148, 136, 0.15) 0px, transparent 50%),
+    radial-gradient(at 50% 80%, rgba(45, 212, 191, 0.12) 0px, transparent 50%),
+    linear-gradient(135deg, #f8fafc 0%, #e2e8f0 100%);
+}
+.fwr-mesh-bg.dark {
+  background:
+    radial-gradient(at 20% 20%, rgba(20, 184, 166, 0.22) 0px, transparent 50%),
+    radial-gradient(at 80% 30%, rgba(13, 148, 136, 0.18) 0px, transparent 50%),
+    radial-gradient(at 50% 80%, rgba(45, 212, 191, 0.14) 0px, transparent 50%),
+    linear-gradient(135deg, #020617 0%, #0f172a 100%);
+}
+
+/* ========== Blur Orbs（登录页装饰光球） ========== */
+.fwr-blur-orb {
+  position: absolute;
+  border-radius: 9999px;
+  filter: blur(80px);
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* ========== Glass 效果（顶部 header） ========== */
+.fwr-glass {
+  backdrop-filter: blur(12px) saturate(150%);
+  -webkit-backdrop-filter: blur(12px) saturate(150%);
+  background-color: rgba(255, 255, 255, 0.7);
+  border-bottom: 1px solid rgba(226, 232, 240, 0.6);
+}
+.fwr-glass.dark {
+  background-color: rgba(15, 23, 42, 0.65);
+  border-bottom: 1px solid rgba(51, 65, 85, 0.5);
+}
+
+/* ========== Logo Glow（侧栏品牌区） ========== */
+.fwr-logo-glow {
+  box-shadow: 0 0 24px rgba(20, 184, 166, 0.45), 0 4px 12px rgba(20, 184, 166, 0.2);
+}
+
+/* ========== Text Gradient（站名 / 品牌字） ========== */
+.fwr-text-gradient {
+  background: linear-gradient(135deg, var(--fwr-primary-500), var(--fwr-primary-700));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  font-weight: 700;
+}
+
+/* ========== StatusDot（彩色圆点状态指示） ========== */
+.fwr-status-dot {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+}
+.fwr-status-dot::before {
+  content: '';
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #94a3b8;
+  flex-shrink: 0;
+  box-shadow: 0 0 0 2px rgba(148, 163, 184, 0.15);
+}
+.fwr-status-dot.success::before {
+  background: var(--fwr-success);
+  box-shadow: 0 0 0 2px rgba(34, 197, 94, 0.18), 0 0 6px rgba(34, 197, 94, 0.45);
+}
+.fwr-status-dot.warning::before {
+  background: var(--fwr-warning);
+  box-shadow: 0 0 0 2px rgba(245, 158, 11, 0.18);
+}
+.fwr-status-dot.danger::before {
+  background: var(--fwr-danger);
+  box-shadow: 0 0 0 2px rgba(239, 68, 68, 0.2);
+}
+.fwr-status-dot.info::before {
+  background: var(--fwr-info);
+  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.18);
+}
+.fwr-status-dot.pulse::before {
+  animation: fwr-pulse 2s ease-in-out infinite;
+}
+@keyframes fwr-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.6; transform: scale(0.85); }
+}
+
+/* ========== KPI Icon Square（紧凑 KPI 卡的彩色图标方块） ========== */
+.fwr-kpi-icon {
+  width: 40px;
+  height: 40px;
+  border-radius: 10px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+/* ========== 滚动条美化 ========== */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.3);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover { background: rgba(148, 163, 184, 0.5); }
+
+/* ========== 工具类 ========== */
+.fwr-card-hover {
+  transition: box-shadow 0.2s, transform 0.2s;
+}
+.fwr-card-hover:hover {
+  box-shadow: 0 8px 24px rgba(20, 184, 166, 0.08);
+  transform: translateY(-1px);
+}
