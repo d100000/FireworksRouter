@@ -16,6 +16,7 @@ from app.api import admin_auth, admin_metrics, admin_models, admin_settings
 from app.api import system as system_api
 from app.config import get_settings
 from app.db import init_db
+from app.gateway import anthropic as anthropic_router
 from app.gateway import router as gateway_router
 from app.services import metrics as metrics_svc
 from app.tasks.scheduler import start_scheduler, stop_scheduler
@@ -68,8 +69,28 @@ app.add_middleware(
 )
 
 
+# 把 APIError 的 detail 字段直接作为响应体（不被 FastAPI 包成 {"detail": ...}）
+from fastapi import Request as _Req
+from fastapi.responses import JSONResponse as _JR
+from app.api.deps import APIError as _APIError
+
+
+@app.exception_handler(_APIError)
+async def _api_error_handler(_request: _Req, exc: _APIError) -> _JR:
+    return _JR(status_code=exc.status_code, content=exc.api_error_payload, headers=exc.headers or {})
+
+
 app.include_router(system_api.router)
+
+# OpenAI 兼容网关：主路径 /v1/* 以及两个常见路径别名 /openai/v1/* 和 /api/v1/*
+# 让用错 SDK 配置（带前缀的 base_url）的客户端也能 work
 app.include_router(gateway_router.router)
+app.include_router(gateway_router.router, prefix="/openai", include_in_schema=False)
+app.include_router(gateway_router.router, prefix="/api", include_in_schema=False)
+
+# Anthropic Claude 协议兼容（Claude Code / Anthropic SDK）
+app.include_router(anthropic_router.router)
+
 app.include_router(admin_auth.router)
 app.include_router(admin_api.router)
 app.include_router(admin_models.router)

@@ -17,6 +17,7 @@ from app.config import get_settings
 from app.crypto import decrypt_key
 from app.db import session_scope
 from app.models import ApiKey, Model, RequestLog, UpstreamKey
+from app.gateway import errors as gw_errors
 from app.services import cooldown, scheduler
 from app.services.models import ResolvedModel
 from app.utils.logger import logger
@@ -36,6 +37,10 @@ _STRIP_REQUEST_HEADERS = {
     "host", "authorization", "content-length", "accept-encoding", "connection",
     "transfer-encoding", "expect", "proxy-connection", "x-forwarded-for", "x-forwarded-proto",
     "x-real-ip",
+    # Anthropic SDK 的 headers — 不能透传给 Fireworks，会让 Fireworks 当成另一个凭据用导致 401
+    "x-api-key", "anthropic-version", "anthropic-beta", "anthropic-dangerous-direct-browser-access",
+    # Gemini SDK headers
+    "x-goog-api-key", "x-goog-api-client",
 }
 
 _STRIP_RESPONSE_HEADERS = {
@@ -277,10 +282,12 @@ async def forward(
                 )
             except scheduler.NoAvailableUpstream:
                 if attempt == 0 and chosen_key is None:
-                    raise HTTPException(
-                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                        detail={"error": {"message": "No available upstream Fireworks key", "type": "no_available_upstream"}},
+                    exc = gw_errors.ServiceUnavailableError(
+                        "当前无可用上游 Key（全部在冷却或被禁用）",
+                        request_id=request_id,
+                        retry_after=30,
                     )
+                    return gw_errors.to_error_response(exc)
                 break
             tried_ids.add(candidate.id)
             chosen_key = candidate
@@ -341,41 +348,51 @@ async def forward(
             break
 
     if upstream_response is None or upstream_client is None:
-        # 全部失败：构造错误响应
-        err_status = status.HTTP_502_BAD_GATEWAY
-        err_message = f"All upstream keys failed (last status={last_error_status})"
-        err_type = "upstream_error"
-        if last_decision and last_decision.cool_whole_key and last_error_status in (400, 422):
-            # 客户端错误透传给下游
-            err_status = last_error_status
-            err_message = last_error_body or err_message
-            err_type = "invalid_request_error"
-        elif last_error_status in (400, 422):
-            err_status = last_error_status
-            err_type = "invalid_request_error"
-            err_message = last_error_body or err_message
+        # 全部失败：按错误类型映射成对应的 OpenAI 错误
+        upstream_msg = gw_errors.parse_upstream_error(
+            last_error_body,
+            default_message=f"all upstream keys exhausted (last_status={last_error_status})",
+        )
+
+        # 客户端错误（400/422）直接透传上游响应；不要包装成"切换失败"
+        if last_error_status in (400, 422):
+            exc_class = gw_errors.InvalidRequestError
+        elif last_error_status == 0:
+            # 全是网络错误
+            exc_class = gw_errors.ServiceUnavailableError
+            upstream_msg = "上游 Fireworks 暂时无法连接，请稍后重试"
+        else:
+            # 按最后一次失败的错误码分类
+            exc_class = gw_errors.classify_upstream_status(last_error_status, last_error_body)
+            # 如果是连切多把都失败，且原因是认证/额度等关键词 → 升级为 ServiceUnavailable
+            if (
+                len(tried_ids) >= 2
+                and exc_class in (gw_errors.AuthenticationError, gw_errors.InsufficientQuotaError)
+            ):
+                exc_class = gw_errors.ServiceUnavailableError
+                upstream_msg = f"已切换 {len(tried_ids)} 把上游 Key 仍失败：{upstream_msg}"
+
+        exc = exc_class(
+            upstream_msg,
+            upstream_status=last_error_status,
+            upstream_body=last_error_body,
+            request_id=request_id,
+            retry_after=30 if exc_class in (gw_errors.RateLimitError, gw_errors.ServiceUnavailableError, gw_errors.OverloadedError) else None,
+        )
 
         await _persist_log(
             request_id=request_id, api_key=api_key, upstream_key=chosen_key,
             model_record=resolved.record,
             public_model=resolved.public_name, upstream_model=resolved.upstream_path,
             endpoint=endpoint_path, stream=is_stream, usage=GatewayUsage(),
-            status_code=last_error_status, error_code=err_type,
-            error_message=(last_error_body or "all upstreams failed")[:500],
+            status_code=last_error_status, error_code=exc.error_type,
+            error_message=(last_error_body or upstream_msg)[:500],
             retry_count=len(tried_ids), ttft_ms=0,
             latency_ms=int((time.perf_counter() - started) * 1000),
             client_ip=request.client.host if request.client else None,
             user_agent=request.headers.get("user-agent"),
         )
-        return JSONResponse(
-            status_code=err_status,
-            content={
-                "error": {
-                    "message": err_message, "type": err_type,
-                    "upstream_status": last_error_status,
-                }
-            },
-        )
+        return gw_errors.to_error_response(exc)
 
     # 非流式响应处理
     if not is_stream:

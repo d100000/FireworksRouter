@@ -104,8 +104,20 @@ async def apply_error(
     http_status: int,
     error_message: str | None = None,
 ) -> Decision:
-    """请求失败：按错误码决策 + 写入冷却态。"""
+    """请求失败：按错误码决策 + 关键词匹配 + 写入冷却态。"""
     retryable, cool_whole, cool_pair, initial_s, max_s, reason = _lookup(http_status)
+
+    # 关键词触发整 Key 立即长期禁用（参考 new-api）
+    from app.gateway.errors import should_disable_key
+    keyword_disable = should_disable_key(error_message) if error_message else False
+    if keyword_disable:
+        retryable = False
+        cool_whole = True
+        cool_pair = False
+        initial_s = 3600
+        max_s = 3600
+        reason = f"keyword_match:{reason}"
+
     decision = Decision(
         retryable=retryable, cool_whole_key=cool_whole, cool_key_model=cool_pair,
         cooldown_seconds=0, reason=reason, error_code=http_status,

@@ -8,7 +8,7 @@ from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import Response
 from sqlalchemy import select
 
-from app.api.deps import ApiKeyDep, SessionDep
+from app.api.deps import APIError, ApiKeyDep, SessionDep
 from app.config import get_settings
 from app.crypto import decrypt_key
 from app.db import session_scope
@@ -29,25 +29,16 @@ async def _parse_body(request: Request) -> dict[str, Any]:
             return {}
         return json.loads(raw)
     except json.JSONDecodeError:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}},
-        ) from None
+        raise APIError(400, "Invalid JSON body", "invalid_request_error") from None
 
 
 def _enforce_acl(api_key, body: dict[str, Any]) -> None:
     requested = body.get("model")
     if not requested:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"error": {"message": "Missing required parameter: model", "type": "invalid_request_error"}},
-        )
+        raise APIError(400, "Missing required parameter: model", "invalid_request_error", "missing_parameter")
     allowed = api_key.allowed_models
     if allowed and requested not in allowed:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={"error": {"message": f"Model '{requested}' not allowed for this API key", "type": "model_not_allowed"}},
-        )
+        raise APIError(403, f"Model '{requested}' not allowed for this API key", "permission_error", "model_not_allowed")
 
 
 def _enforce_max_tokens(api_key, body: dict[str, Any]) -> None:
@@ -56,28 +47,19 @@ def _enforce_max_tokens(api_key, body: dict[str, Any]) -> None:
         return
     requested = body.get("max_tokens") or body.get("max_completion_tokens")
     if isinstance(requested, int) and requested > cap:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"error": {"message": f"max_tokens={requested} exceeds cap {cap}", "type": "invalid_request_error"}},
-        )
+        raise APIError(400, f"max_tokens={requested} exceeds cap {cap}", "invalid_request_error")
 
 
 def _enforce_stream(api_key, body: dict[str, Any]) -> None:
     if body.get("stream") and not api_key.stream_enabled:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={"error": {"message": "Streaming is disabled for this API key", "type": "forbidden"}},
-        )
+        raise APIError(403, "Streaming is disabled for this API key", "permission_error", "stream_disabled")
 
 
 async def _resolve_and_check(session, api_key, body: dict[str, Any]):
     requested = body.get("model") or ""
     resolved = await models_svc.resolve(session, requested)
     if resolved.record is not None and resolved.record.status != ModelStatus.active:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={"error": {"message": f"Model '{requested}' is disabled", "type": "model_not_found"}},
-        )
+        raise APIError(404, f"Model '{requested}' is disabled", "not_found_error", "model_not_found")
     return resolved
 
 
@@ -173,15 +155,9 @@ async def list_models(api_key: ApiKeyDep, session: SessionDep):
 async def get_model(model_id: str, api_key: ApiKeyDep, session: SessionDep):
     resolved = await models_svc.resolve(session, model_id)
     if resolved.record is None or resolved.record.status != ModelStatus.active:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={"error": {"message": f"Model '{model_id}' not found", "type": "model_not_found"}},
-        )
+        raise APIError(404, f"Model '{model_id}' not found", "not_found_error", "model_not_found")
     if not _filter_by_acl([resolved.record], api_key):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={"error": {"message": "Model not allowed", "type": "model_not_allowed"}},
-        )
+        raise APIError(403, "Model not allowed", "permission_error", "model_not_allowed")
     return _model_to_openai_dict(resolved.record)
 
 
@@ -193,10 +169,7 @@ async def _proxy_multipart(request: Request, api_key, endpoint_path: str):
         try:
             picked = await scheduler.pick(session, api_key_id=api_key.id)
         except scheduler.NoAvailableUpstream:
-            raise HTTPException(
-                status_code=503,
-                detail={"error": {"message": "No available upstream key", "type": "no_available_upstream"}},
-            ) from None
+            raise APIError(503, "No available upstream key", "service_unavailable", "no_available_upstream") from None
         plain = decrypt_key(picked.key_encrypted)
         preview = picked.key_preview
 
