@@ -7,6 +7,7 @@ export const systemApi = {
 export const authApi = {
   login: (data) => api.post('/admin/auth/login', data),
   logout: () => api.post('/admin/auth/logout'),
+  changePassword: (data) => api.post('/admin/auth/change-password', data),
 }
 
 export const upstreamApi = {

@@ -424,6 +424,12 @@ async def list_request_logs(
     upstream_key_id: int | None = None,
     api_key_id: int | None = None,
     status_code: int | None = None,
+    status_min: int | None = None,
+    status_max: int | None = None,
+    model: str | None = None,
+    stream: str | None = None,
+    request_id: str | None = None,
+    period: str | None = Query(None, description="1h / 24h / 7d / all"),
 ) -> dict[str, Any]:
     stmt = select(RequestLog).order_by(desc(RequestLog.id))
     if upstream_key_id is not None:
@@ -432,6 +438,24 @@ async def list_request_logs(
         stmt = stmt.where(RequestLog.api_key_id == api_key_id)
     if status_code is not None:
         stmt = stmt.where(RequestLog.status_code == status_code)
+    if status_min is not None:
+        stmt = stmt.where(RequestLog.status_code >= status_min)
+    if status_max is not None:
+        stmt = stmt.where(RequestLog.status_code <= status_max)
+    if model:
+        stmt = stmt.where(RequestLog.public_model == model)
+    if stream is not None:
+        if stream.lower() in ("true", "1"):
+            stmt = stmt.where(RequestLog.stream.is_(True))
+        elif stream.lower() in ("false", "0"):
+            stmt = stmt.where(RequestLog.stream.is_(False))
+    if request_id:
+        stmt = stmt.where(RequestLog.request_id.like(f"%{request_id}%"))
+    if period and period != "all":
+        delta = {"1h": timedelta(hours=1), "24h": timedelta(hours=24), "7d": timedelta(days=7)}.get(period)
+        if delta:
+            since = datetime.now(timezone.utc) - delta
+            stmt = stmt.where(RequestLog.created_at >= since)
     rows = list((await session.execute(stmt.limit(limit).offset(offset))).scalars().all())
     return {
         "items": [

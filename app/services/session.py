@@ -18,6 +18,7 @@ settings = get_settings()
 _pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 SESSION_KIND = "admin_session"
+DB_SETTING_KEY = "admin.password_hash"
 
 
 def hash_password(password: str) -> str:
@@ -29,6 +30,24 @@ def verify_password(password: str, hashed: str) -> bool:
         return _pwd.verify(password, hashed)
     except Exception:  # noqa: BLE001
         return False
+
+
+def get_effective_password_hash() -> str:
+    """DB 中如果有 admin.password_hash 则用 DB 的（管理员改过密码）；否则用 .env 的初始值。"""
+    from app.services import settings as settings_svc
+    db_val = settings_svc.get(DB_SETTING_KEY)
+    if db_val and isinstance(db_val, str) and db_val.startswith("$2"):
+        return db_val
+    return settings.admin_password_hash
+
+
+async def update_admin_password(new_password: str) -> None:
+    from app.services import settings as settings_svc
+    await settings_svc.set_value(
+        DB_SETTING_KEY,
+        hash_password(new_password),
+        description="Admin login password (bcrypt). Overrides .env ADMIN_PASSWORD_HASH.",
+    )
 
 
 def create_session_token() -> str:

@@ -60,6 +60,30 @@
               <span class="user-label">Admin</span>
             </div>
           </n-dropdown>
+
+          <!-- 修改密码弹窗 -->
+          <n-modal v-model:show="pwShow" preset="card" title="修改管理密码" style="width: 440px">
+            <n-form ref="pwFormRef" :model="pwForm" :rules="pwRules" label-placement="top">
+              <n-form-item label="当前密码" path="old_password">
+                <n-input v-model:value="pwForm.old_password" type="password" show-password-on="click" placeholder="旧密码" />
+              </n-form-item>
+              <n-form-item label="新密码（≥ 8 位）" path="new_password">
+                <n-input v-model:value="pwForm.new_password" type="password" show-password-on="click" placeholder="新密码" />
+              </n-form-item>
+              <n-form-item label="确认新密码" path="confirm">
+                <n-input v-model:value="pwForm.confirm" type="password" show-password-on="click" placeholder="再次输入" @keyup.enter="submitPw" />
+              </n-form-item>
+            </n-form>
+            <n-alert type="info" :show-icon="false" style="margin-bottom: 12px">
+              修改后立即生效，下次登录使用新密码。当前 session 仍有效至过期。
+            </n-alert>
+            <template #footer>
+              <n-space justify="end">
+                <n-button @click="pwShow = false">取消</n-button>
+                <n-button type="primary" :loading="pwSaving" @click="submitPw">保存</n-button>
+              </n-space>
+            </template>
+          </n-modal>
         </n-space>
       </n-layout-header>
 
@@ -71,17 +95,20 @@
 </template>
 
 <script setup>
-import { computed, h, ref } from 'vue'
+import { computed, h, ref, reactive } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { NIcon } from 'naive-ui'
+import { NIcon, useMessage } from 'naive-ui'
 import { useAuthStore } from '@/stores/auth'
 import { useThemeStore } from '@/stores/theme'
+import { authApi } from '@/api'
 import {
   StatsChartOutline, KeyOutline, CubeOutline,
   DocumentTextOutline, PulseOutline, LockClosedOutline,
   LogOutOutline, SettingsOutline, MoonOutline, SunnyOutline,
-  GitNetworkOutline,
+  GitNetworkOutline, ShieldCheckmarkOutline,
 } from '@vicons/ionicons5'
+
+const message = useMessage()
 
 const route = useRoute()
 const router = useRouter()
@@ -108,13 +135,54 @@ const pageTitle = computed(() => route.meta?.title || '')
 function onSelect(key) { router.push(key) }
 
 const userMenu = [
+  { label: '修改密码', key: 'change-password', icon: renderIcon(ShieldCheckmarkOutline) },
+  { type: 'divider' },
   { label: '退出登录', key: 'logout', icon: renderIcon(LogOutOutline) },
 ]
+
+const pwShow = ref(false)
+const pwSaving = ref(false)
+const pwFormRef = ref(null)
+const pwForm = reactive({ old_password: '', new_password: '', confirm: '' })
+const pwRules = {
+  old_password: { required: true, message: '请输入当前密码', trigger: 'blur' },
+  new_password: { required: true, min: 8, message: '新密码至少 8 位', trigger: 'blur' },
+  confirm: {
+    validator(_, value) {
+      if (!value) return new Error('请确认新密码')
+      if (value !== pwForm.new_password) return new Error('两次输入不一致')
+      return true
+    },
+    trigger: 'blur',
+  },
+}
+
+async function submitPw() {
+  try { await pwFormRef.value?.validate() } catch (_) { return }
+  pwSaving.value = true
+  try {
+    await authApi.changePassword({
+      old_password: pwForm.old_password,
+      new_password: pwForm.new_password,
+    })
+    message.success('密码已更新，下次登录使用新密码')
+    pwShow.value = false
+    pwForm.old_password = ''
+    pwForm.new_password = ''
+    pwForm.confirm = ''
+  } catch (e) {
+    message.error(e?.response?.data?.detail?.error?.message || '修改失败')
+  } finally {
+    pwSaving.value = false
+  }
+}
 
 function onUserMenu(key) {
   if (key === 'logout') {
     auth.logout()
     router.push('/login')
+  } else if (key === 'change-password') {
+    pwShow.value = true
   }
 }
 
