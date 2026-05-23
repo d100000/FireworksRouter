@@ -55,7 +55,16 @@ class Settings(BaseSettings):
 
     @property
     def proxy_url(self) -> str | None:
-        return self.https_proxy or self.http_proxy
+        """返回上游代理 URL。空字符串视为未配置（httpx 0.27+ 不接受空 proxy）。
+
+        bug 场景：用户 .env 写 `HTTP_PROXY=` 留空值，pydantic-settings 读成 ""，
+        旧版直接 `https or http` 返回 ""，传给 httpx.AsyncClient(proxy="") 报
+        ValueError: Unknown scheme for proxy URL URL('')。
+        """
+        for raw in (self.https_proxy, self.http_proxy):
+            if raw and raw.strip():
+                return raw.strip()
+        return None
 
 
 @lru_cache
