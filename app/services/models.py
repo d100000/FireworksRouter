@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Model, ModelCategory, ModelStatus
 from app.services import fireworks as fw
+from app.services.known_prices import lookup_price
 
 
 @dataclass
@@ -68,12 +69,16 @@ def _public_name_from_path(fireworks_path: str) -> str:
 async def sync_from_fireworks(session: AsyncSession, api_key: str) -> dict[str, int]:
     """从 Fireworks /inference/v1/models 同步模型到本地。
 
-    - 新模型：插入，status=disabled，等管理员手动启用并填价
-    - 已存在：更新 context_length / supports_* 这类元数据
+    - 新模型：插入，自动从已知价格表填充定价，命中则 status=active，未命中则 disabled
+    - 已存在：更新元数据；价格仅在原本为 0 时才填（不覆盖管理员手填的价格）
+    - 返回：total / created / updated / priced（命中价格表的总数）/ unpriced（无价格需手填）
     """
     items = await fw.list_models(api_key)
     created = 0
     updated = 0
+    priced = 0
+    unpriced = 0
+
     for it in items:
         path: str = it.get("id") or ""
         if not path:
@@ -86,7 +91,16 @@ async def sync_from_fireworks(session: AsyncSession, api_key: str) -> dict[str, 
         supports_chat = bool(it.get("supports_chat"))
         supports_vision = bool(it.get("supports_image_input"))
         supports_tools = bool(it.get("supports_tools"))
+
+        # 查已知价格表
+        price = lookup_price(path)
+        # 命中价格表即可自动启用（包括图像/嵌入这种 token 价为 0 的模型 —
+        # 它们按张/请求计费，由上游直接扣，本网关只代理）
+        has_known_entry = price is not None
+
         if existing is None:
+            # 新增：命中已知表 → 自动 active；未命中 → disabled 等管理员填
+            new_status = ModelStatus.active if has_known_entry else ModelStatus.disabled
             session.add(
                 Model(
                     public_name=_public_name_from_path(path),
@@ -96,15 +110,45 @@ async def sync_from_fireworks(session: AsyncSession, api_key: str) -> dict[str, 
                     supports_streaming=supports_chat,
                     supports_tools=supports_tools,
                     supports_vision=supports_vision,
-                    status=ModelStatus.disabled,
+                    status=new_status,
+                    input_price_per_1m=price.input_per_1m if price else 0.0,
+                    output_price_per_1m=price.output_per_1m if price else 0.0,
+                    cached_input_price_per_1m=price.cached_input_per_1m if price else 0.0,
+                    description=price.note if price else None,
                 )
             )
             created += 1
+            if has_known_entry:
+                priced += 1
+            else:
+                unpriced += 1
         else:
             existing.category = category
             existing.context_length = context_length or existing.context_length
             existing.supports_streaming = supports_chat or existing.supports_streaming
             existing.supports_tools = supports_tools or existing.supports_tools
             existing.supports_vision = supports_vision or existing.supports_vision
+
+            # 价格回填：只在现有价格为 0 时填（不覆盖管理员手动设置的）
+            if price is not None:
+                if existing.input_price_per_1m == 0 and price.input_per_1m > 0:
+                    existing.input_price_per_1m = price.input_per_1m
+                if existing.output_price_per_1m == 0 and price.output_per_1m > 0:
+                    existing.output_price_per_1m = price.output_per_1m
+                if existing.cached_input_price_per_1m == 0 and price.cached_input_per_1m > 0:
+                    existing.cached_input_price_per_1m = price.cached_input_per_1m
+                if not existing.description and price.note:
+                    existing.description = price.note
             updated += 1
-    return {"total": len(items), "created": created, "updated": updated}
+            if existing.input_price_per_1m > 0 or existing.output_price_per_1m > 0:
+                priced += 1
+            else:
+                unpriced += 1
+
+    return {
+        "total": len(items),
+        "created": created,
+        "updated": updated,
+        "priced": priced,
+        "unpriced": unpriced,
+    }
