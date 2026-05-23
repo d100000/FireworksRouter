@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app import __version__
 from app.api import admin as admin_api
-from app.api import admin_auth, admin_metrics, admin_models, admin_price_catalog, admin_settings
+from app.api import admin_auth, admin_logs, admin_metrics, admin_models, admin_price_catalog, admin_settings
 from app.api import system as system_api
 from app.config import get_settings
 from app.db import init_db
@@ -20,7 +20,7 @@ from app.gateway import anthropic as anthropic_router
 from app.gateway import router as gateway_router
 from app.services import metrics as metrics_svc
 from app.tasks.scheduler import start_scheduler, stop_scheduler
-from app.utils.logger import logger, setup_logging
+from app.utils.logger import logger, setup_logging, start_db_sink, stop_db_sink
 
 settings = get_settings()
 
@@ -39,6 +39,9 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         await _pc.seed_initial(_s)
     sched = start_scheduler()
     metrics_svc.start_workers()
+    # 启动 DB sink worker（之前 setup_logging 已注册 sink，但 worker 未起，
+    # 早期 INFO/WARNING 会沉默丢弃；从这里起入 DB）
+    await start_db_sink()
 
     if settings.probe_on_startup:
         async def _initial_probe() -> None:
@@ -56,6 +59,8 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         metrics_svc.stop_workers()
         stop_scheduler()
         _ = sched
+        # 在 logger 关闭前 flush 一次 DB sink，再退出
+        await stop_db_sink()
         logger.info("FireworkRouter shutdown complete")
 
 
@@ -102,6 +107,7 @@ app.include_router(admin_models.router)
 app.include_router(admin_price_catalog.router)
 app.include_router(admin_settings.router)
 app.include_router(admin_metrics.router)
+app.include_router(admin_logs.router)
 
 
 @app.get("/healthz", tags=["meta"])

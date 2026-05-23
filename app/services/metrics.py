@@ -290,41 +290,59 @@ async def _refresh_last_probe() -> None:
             k.last_probe_at = at
 
 
+async def run_cleanup_once() -> dict[str, int]:
+    """跑一次清理；返回每张表删了多少行。供 _cleaner 后台任务 + 手动「立即清理」按钮共用。"""
+    from app.services import settings as settings_svc
+    from app.models import ProbeHistory, RequestLog, SystemLog
+
+    now = datetime.now(timezone.utc)
+
+    bucket_hours = int(settings_svc.get("metric_buckets_retention_hours") or 25)
+    probe_days = int(settings_svc.get("probe_history_retention_days") or 7)
+    request_log_days = int(settings_svc.get("logs_retention_days") or 30)
+    system_log_days = int(settings_svc.get("system_logs_retention_days") or 14)
+
+    cutoff_bucket = now - timedelta(hours=bucket_hours)
+    cutoff_probe = now - timedelta(days=probe_days)
+    cutoff_req = now - timedelta(days=request_log_days)
+    cutoff_sys = now - timedelta(days=system_log_days)
+
+    async with session_scope() as session:
+        r1 = await session.execute(
+            delete(KeyMetricBucket).where(KeyMetricBucket.bucket_start < cutoff_bucket)
+        )
+        r2 = await session.execute(
+            delete(ProbeHistory).where(ProbeHistory.created_at < cutoff_probe)
+        )
+        r3 = await session.execute(
+            delete(RequestLog).where(RequestLog.created_at < cutoff_req)
+        )
+        r4 = await session.execute(
+            delete(SystemLog).where(SystemLog.timestamp < cutoff_sys)
+        )
+
+    deleted = {
+        "metric_buckets": r1.rowcount or 0,
+        "probe_history": r2.rowcount or 0,
+        "request_logs": r3.rowcount or 0,
+        "system_logs": r4.rowcount or 0,
+    }
+    logger.info(
+        "cleaner: deleted metric_buckets={} probe_history={} request_logs={} system_logs={} "
+        "(retention: bucket={}h probe={}d req={}d sys={}d)",
+        deleted["metric_buckets"], deleted["probe_history"],
+        deleted["request_logs"], deleted["system_logs"],
+        bucket_hours, probe_days, request_log_days, system_log_days,
+    )
+    return deleted
+
+
 async def _cleaner() -> None:
-    """每小时清理：
-    1) key_metric_buckets 24h 之前的桶
-    2) probe_history 7 天前的记录
-    3) request_logs 配置项 logs_retention_days 天前的记录（默认 30 天）
-    """
+    """每小时跑一次清理。详见 run_cleanup_once。"""
     while True:
         try:
             await asyncio.sleep(3600)
-            now = datetime.now(timezone.utc)
-
-            # 1) metric buckets — 保留 25h
-            cutoff_bucket = now - timedelta(hours=25)
-            # 2) probe history — 保留 7 天
-            cutoff_probe = now - timedelta(days=7)
-            # 3) request logs — 保留 N 天（系统设置）
-            from app.services import settings as settings_svc
-            from app.models import ProbeHistory, RequestLog
-            retention_days = int(settings_svc.get("logs_retention_days") or 30)
-            cutoff_logs = now - timedelta(days=retention_days)
-
-            async with session_scope() as session:
-                r1 = await session.execute(
-                    delete(KeyMetricBucket).where(KeyMetricBucket.bucket_start < cutoff_bucket)
-                )
-                r2 = await session.execute(
-                    delete(ProbeHistory).where(ProbeHistory.created_at < cutoff_probe)
-                )
-                r3 = await session.execute(
-                    delete(RequestLog).where(RequestLog.created_at < cutoff_logs)
-                )
-                logger.info(
-                    "cleaner: deleted metric_buckets={} probe_history={} request_logs={} (retention={}d)",
-                    r1.rowcount or 0, r2.rowcount or 0, r3.rowcount or 0, retention_days,
-                )
+            await run_cleanup_once()
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001

@@ -26,7 +26,14 @@ DEFAULTS: dict[str, Any] = {
     "cooldown.429_max_seconds": 1800,
     "cooldown.5xx_initial_seconds": 60,
     "cooldown.5xx_max_seconds": 1800,
-    "logs_retention_days": 30,
+    # 日志保留期（天）
+    "logs_retention_days": 30,            # request_logs（API 调用流水）
+    "system_logs_retention_days": 14,     # system_logs（应用日志：错误/异常等）
+    "probe_history_retention_days": 7,    # probe_history（余额探针历史）
+    "metric_buckets_retention_hours": 25, # key_metric_buckets（5 分钟桶）
+    # 应用日志入库最低级别（DEBUG/INFO/WARNING/ERROR/CRITICAL）
+    # 默认 WARNING+ — INFO/DEBUG 量大不入 DB，避免膨胀
+    "system_log_min_level": "WARNING",
 }
 
 _cache: dict[str, Any] = {}

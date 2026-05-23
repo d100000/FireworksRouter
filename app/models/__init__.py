@@ -10,6 +10,7 @@ from app.models.model_price_catalog import (
 )
 from app.models.probe_history import ProbeHistory
 from app.models.request_log import RequestLog
+from app.models.system_log import SystemLog
 from app.models.system_setting import SystemSetting
 from app.models.upstream_key import UpstreamKey, UpstreamKeyStatus
 
@@ -28,6 +29,7 @@ __all__ = [
     "PriceUnit",
     "ProbeHistory",
     "RequestLog",
+    "SystemLog",
     "SystemSetting",
     "UpstreamKey",
     "UpstreamKeyStatus",
