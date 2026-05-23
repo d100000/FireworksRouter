@@ -65,53 +65,86 @@ async def register_key_quick(
 
 
 async def probe_after_register(key_id: int) -> None:
-    """在独立 session 中跑一次完整探针 + 状态决策。
+    """三段式探针（读快照 → HTTP → 写回），避免 HTTP 期间占用 DB 连接。
 
     设计上独立运行（asyncio.create_task），允许批量导入快速返回。
     异常静默吞掉，保留 status=testing/unhealthy 让定时探针下次重试。
     """
     from app.db import session_scope
 
+    # ① 读快照：拿 plaintext 后立即关 session
     try:
         async with session_scope() as session:
             record = await session.get(UpstreamKey, key_id)
             if record is None:
                 return
             plaintext = decrypt_key(record.key_encrypted)
+            existing_account_id = record.account_id
+            current_rpm_limit = record.rpm_limit
+    except Exception as e:  # noqa: BLE001
+        logger.exception("probe_after_register #{} snapshot failed: {}", key_id, e)
+        return
 
-            # 1. list_accounts
-            try:
-                accounts = await fw.list_accounts(plaintext)
-                if not accounts:
-                    record.status = UpstreamKeyStatus.auto_disabled
-                    record.auto_disable_reason = "no_accessible_account"
-                    record.disabled_at = datetime.now(timezone.utc)
-                    return
-                primary = accounts[0]
+    # ② HTTP：不持 DB 连接
+    accounts_err: str | None = None
+    quotas_err: str | None = None
+    primary = None
+    snap = None
+    try:
+        accounts = await fw.list_accounts(plaintext)
+        if not accounts:
+            accounts_err = "no_accessible_account"
+        else:
+            primary = accounts[0]
+    except Exception as e:  # noqa: BLE001
+        accounts_err = f"list_accounts_error: {str(e)[:200]}"
+        logger.warning("probe_after_register #{} list_accounts failed: {}", key_id, e)
+
+    # 拿到 account_id 才有意义查 quotas
+    if primary or existing_account_id:
+        try:
+            account_id_for_quotas = primary.account_id if primary else existing_account_id
+            snap = await fw.list_quotas(plaintext, account_id_for_quotas)
+        except Exception as e:  # noqa: BLE001
+            quotas_err = str(e)[:200]
+            logger.warning("probe_after_register #{} list_quotas failed: {}", key_id, e)
+
+    # ③ 写回
+    try:
+        async with session_scope() as session:
+            record = await session.get(UpstreamKey, key_id)
+            if record is None:
+                return
+
+            # 账户级失败 — 直接 auto_disabled
+            if accounts_err == "no_accessible_account":
+                record.status = UpstreamKeyStatus.auto_disabled
+                record.auto_disable_reason = "no_accessible_account"
+                record.disabled_at = datetime.now(timezone.utc)
+                return
+            if accounts_err:
+                record.status = UpstreamKeyStatus.unhealthy
+                record.auto_disable_reason = accounts_err
+                record.disabled_at = datetime.now(timezone.utc)
+                return
+
+            # 写账户元数据
+            if primary:
                 record.account_id = primary.account_id
                 record.account_email = primary.email
                 record.account_state = primary.state
                 record.suspend_state = primary.suspend_state
-            except Exception as e:  # noqa: BLE001
-                logger.warning("probe_after_register #{} list_accounts failed: {}", key_id, e)
-                record.status = UpstreamKeyStatus.unhealthy
-                record.auto_disable_reason = f"list_accounts_error: {str(e)[:200]}"
-                record.disabled_at = datetime.now(timezone.utc)
-                return
 
-            # 2. list_quotas
-            try:
-                snap = await fw.list_quotas(plaintext, record.account_id)
+            # 写 quotas
+            if snap:
                 record.monthly_spend_limit_usd = snap.monthly_spend_limit_usd
                 record.monthly_spend_used_usd = snap.monthly_spend_used_usd
                 record.balance_usd = snap.monthly_spend_remaining_usd
-                if record.rpm_limit == 0 and snap.serverless_rpm > 0:
+                if current_rpm_limit == 0 and snap.serverless_rpm > 0:
                     record.rpm_limit = snap.serverless_rpm
                 record.balance_updated_at = datetime.now(timezone.utc)
-            except Exception as e:  # noqa: BLE001
-                logger.warning("probe_after_register #{} list_quotas failed: {}", key_id, e)
 
-            # 3. 状态决策
+            # 状态决策
             if record.suspend_state and record.suspend_state.upper() != "UNSUSPENDED":
                 record.status = UpstreamKeyStatus.auto_disabled
                 record.auto_disable_reason = f"suspend_state={record.suspend_state}"
@@ -119,7 +152,7 @@ async def probe_after_register(key_id: int) -> None:
             else:
                 record.status = UpstreamKeyStatus.active
     except Exception as e:  # noqa: BLE001
-        logger.exception("probe_after_register #{} fatal: {}", key_id, e)
+        logger.exception("probe_after_register #{} write-back failed: {}", key_id, e)
 
 
 async def register_key(

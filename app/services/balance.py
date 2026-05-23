@@ -23,36 +23,53 @@ class ProbeResult:
     key_id: int
     ok: bool
     balance_usd: float = 0.0
+    # 新增：探针拿到的 limit/used，用于回写 record 与 ProbeHistory
+    monthly_spend_limit_usd: float = 0.0
+    monthly_spend_used_usd: float = 0.0
     suspend_state: str | None = None
     account_state: str | None = None
+    # 新增：探针首次发现的 account_id / email（record 原本为 None 时填）
+    discovered_account_id: str | None = None
+    discovered_account_email: str | None = None
     error: str | None = None
     latency_ms: int = 0
     new_status: UpstreamKeyStatus | None = None
     disable_reason: str | None = None
 
 
-async def _probe_single(record: UpstreamKey) -> ProbeResult:
-    started = time.perf_counter()
-    plaintext = decrypt_key(record.key_encrypted)
+async def _probe_http_only(
+    key_id: int,
+    plaintext: str,
+    existing_account_id: str | None,
+) -> ProbeResult:
+    """纯 HTTP 阶段：调 Fireworks 控制面拿 account + quota，不持有任何 DB session。
 
-    result = ProbeResult(key_id=record.id, ok=False)
+    被 probe_one 在「关掉读 session」和「打开写 session」之间调用。
+    所有 IO 都在这里发生，连接池不会被一个长 HTTP 卡住。
+    """
+    started = time.perf_counter()
+    result = ProbeResult(key_id=key_id, ok=False)
     try:
-        if not record.account_id:
+        account_id = existing_account_id
+        if not account_id:
             accounts = await fw.list_accounts(plaintext)
             if not accounts:
                 result.error = "no_accessible_account"
                 result.new_status = UpstreamKeyStatus.auto_disabled
                 result.disable_reason = "no_accessible_account"
                 return result
-            record.account_id = accounts[0].account_id
-            record.account_email = accounts[0].email
+            account_id = accounts[0].account_id
+            result.discovered_account_id = account_id
+            result.discovered_account_email = accounts[0].email
 
-        account = await fw.get_account(plaintext, record.account_id)
+        account = await fw.get_account(plaintext, account_id)
         result.suspend_state = account.suspend_state
         result.account_state = account.state
 
-        snap = await fw.list_quotas(plaintext, record.account_id)
+        snap = await fw.list_quotas(plaintext, account_id)
         result.balance_usd = snap.monthly_spend_remaining_usd
+        result.monthly_spend_limit_usd = snap.monthly_spend_limit_usd
+        result.monthly_spend_used_usd = snap.monthly_spend_used_usd
 
         # 状态决策
         if account.suspend_state and account.suspend_state.upper() != "UNSUSPENDED":
@@ -65,14 +82,6 @@ async def _probe_single(record: UpstreamKey) -> ProbeResult:
             )
         else:
             result.new_status = UpstreamKeyStatus.active
-
-        # 写回字段
-        record.suspend_state = account.suspend_state
-        record.account_state = account.state
-        record.monthly_spend_limit_usd = snap.monthly_spend_limit_usd
-        record.monthly_spend_used_usd = snap.monthly_spend_used_usd
-        record.balance_usd = result.balance_usd
-        record.balance_updated_at = datetime.now(timezone.utc)
         result.ok = True
     except fw.FireworksError as e:
         result.error = str(e)
@@ -92,6 +101,26 @@ async def _probe_single(record: UpstreamKey) -> ProbeResult:
 
 
 def _apply_result(record: UpstreamKey, result: ProbeResult) -> None:
+    """在写 session 内根据 result 更新 record。
+
+    防御性：如果 record 已被管理员手动禁用（enabled=False 或 status=disabled），
+    保留禁用状态，只更新余额数字与历史 — 避免和管理员操作竞争覆盖。
+    """
+    # 数据字段总是写（即使探针失败也想记下 attempt）
+    if result.ok:
+        record.suspend_state = result.suspend_state
+        record.account_state = result.account_state
+        record.monthly_spend_limit_usd = result.monthly_spend_limit_usd
+        record.monthly_spend_used_usd = result.monthly_spend_used_usd
+        record.balance_usd = result.balance_usd
+        record.balance_updated_at = datetime.now(timezone.utc)
+    if result.discovered_account_id and not record.account_id:
+        record.account_id = result.discovered_account_id
+        record.account_email = result.discovered_account_email
+
+    # status 决策：管理员手动 disabled 时不动
+    if not record.enabled or record.status == UpstreamKeyStatus.disabled:
+        return
     if result.new_status is None:
         return
     record.status = result.new_status
@@ -105,16 +134,33 @@ def _apply_result(record: UpstreamKey, result: ProbeResult) -> None:
 
 
 async def probe_one(key_id: int) -> ProbeResult | None:
+    """三段式：① 读快照 → ② 纯 HTTP → ③ 写回。
+
+    HTTP 期间不持有 DB 连接，避免 probe_concurrency 个并发 probe 占满连接池。
+    """
+    # ① 读快照（短）
     async with session_scope() as session:
         record = await session.get(UpstreamKey, key_id)
         if record is None:
             return None
-        result = await _probe_single(record)
+        plaintext = decrypt_key(record.key_encrypted)
+        existing_account_id = record.account_id
+        key_preview = record.key_preview  # 用于 ProbeHistory
+
+    # ② HTTP — 不持连接（可能耗时 10-30s）
+    result = await _probe_http_only(key_id, plaintext, existing_account_id)
+
+    # ③ 写回（短）— 重新 fetch 防止 stale；写状态、余额、ProbeHistory
+    async with session_scope() as session:
+        record = await session.get(UpstreamKey, key_id)
+        if record is None:
+            # 探针期间被删除 — 只返回 HTTP 结果，不写历史
+            return result
         _apply_result(record, result)
         session.add(
             ProbeHistory(
                 upstream_key_id=record.id,
-                upstream_key_preview=record.key_preview,
+                upstream_key_preview=record.key_preview or key_preview,
                 success="ok" if result.ok else "error",
                 balance_usd=result.balance_usd,
                 monthly_spend_limit_usd=record.monthly_spend_limit_usd,
@@ -125,7 +171,7 @@ async def probe_one(key_id: int) -> ProbeResult | None:
                 latency_ms=result.latency_ms,
             )
         )
-        return result
+    return result
 
 
 # ============================ 轻量级余额刷新 ============================
@@ -215,11 +261,12 @@ async def refresh_balance_one(key_id: int) -> BalanceRefreshResult | None:
     - 不写 ProbeHistory（不污染探针日志）
     - 手动禁用（status=disabled 或 enabled=False）的 Key **不调用上游**，直接返回 skipped
 
-    适用：管理员手动 UI 上点「更新余额」，想看实时数字但不想触发状态变更。
-    定期健康探针请走 probe_one / run_probe_round。
+    三段式（同 probe_one）：① 读快照 + 提前过滤禁用 → ② HTTP → ③ 写回。
+    HTTP 期间不持 DB 连接。
     """
     started = time.perf_counter()
 
+    # ① 读快照
     async with session_scope() as session:
         record = await session.get(UpstreamKey, key_id)
         if record is None:
@@ -235,7 +282,6 @@ async def refresh_balance_one(key_id: int) -> BalanceRefreshResult | None:
             previous_used_usd=prev_used,
         )
 
-        # 跳过手动禁用的 Key —— 用户已经主动 disable，没必要再调上游浪费时间/触发 401
         if not record.enabled or record.status == UpstreamKeyStatus.disabled:
             result.skipped = True
             result.error_type = "key_disabled"
@@ -245,47 +291,64 @@ async def refresh_balance_one(key_id: int) -> BalanceRefreshResult | None:
             return result
 
         plaintext = decrypt_key(record.key_encrypted)
-        try:
-            # 1. 如果还没 account_id，先 list_accounts 拿一个
-            if not record.account_id:
-                accounts = await fw.list_accounts(plaintext)
-                if not accounts:
-                    result.error_type = "no_account"
-                    result.error = "该 Key 没有可访问的 Fireworks 账户"
-                    result.suggestion = "检查 Key 是否被吊销或拼写错误"
-                    return result
-                record.account_id = accounts[0].account_id
-                record.account_email = accounts[0].email
+        existing_account_id = record.account_id
+        snap_suspend_state = record.suspend_state
+        snap_account_state = record.account_state
 
-            # 2. 查 quotas（这一步是核心）
-            snap = await fw.list_quotas(plaintext, record.account_id)
+    # ② HTTP — 不持 DB 连接
+    discovered_account_id: str | None = None
+    discovered_account_email: str | None = None
+    snap_data = None
+    try:
+        if not existing_account_id:
+            accounts = await fw.list_accounts(plaintext)
+            if not accounts:
+                result.error_type = "no_account"
+                result.error = "该 Key 没有可访问的 Fireworks 账户"
+                result.suggestion = "检查 Key 是否被吊销或拼写错误"
+                result.latency_ms = int((time.perf_counter() - started) * 1000)
+                return result
+            existing_account_id = accounts[0].account_id
+            discovered_account_id = existing_account_id
+            discovered_account_email = accounts[0].email
 
-            # 3. 写余额字段（不动 status / suspend_state / cooldown / disabled_at）
-            record.monthly_spend_limit_usd = snap.monthly_spend_limit_usd
-            record.monthly_spend_used_usd = snap.monthly_spend_used_usd
-            record.balance_usd = snap.monthly_spend_remaining_usd
-            record.balance_updated_at = datetime.now(timezone.utc)
-
-            # 填返回结果
-            result.balance_usd = snap.monthly_spend_remaining_usd
-            result.monthly_spend_limit_usd = snap.monthly_spend_limit_usd
-            result.monthly_spend_used_usd = snap.monthly_spend_used_usd
-            if snap.monthly_spend_limit_usd > 0:
-                result.used_percent = snap.monthly_spend_used_usd / snap.monthly_spend_limit_usd * 100
-                result.balance_percent = result.balance_usd / snap.monthly_spend_limit_usd * 100
-            result.delta_balance_usd = result.balance_usd - prev_balance
-            result.delta_used_usd = snap.monthly_spend_used_usd - prev_used
-            result.suspend_state = record.suspend_state
-            result.account_state = record.account_state
-            result.ok = True
-        except (fw.FireworksError, Exception) as e:
-            err_type, friendly, suggest = _classify_balance_error(e)
-            result.error_type = err_type
-            result.error = friendly
-            result.suggestion = suggest
-
+        snap_data = await fw.list_quotas(plaintext, existing_account_id)
+    except (fw.FireworksError, Exception) as e:
+        err_type, friendly, suggest = _classify_balance_error(e)
+        result.error_type = err_type
+        result.error = friendly
+        result.suggestion = suggest
         result.latency_ms = int((time.perf_counter() - started) * 1000)
         return result
+
+    # ③ 写回
+    async with session_scope() as session:
+        record = await session.get(UpstreamKey, key_id)
+        if record is None:
+            # 期间被删除：只填 result，不写库
+            result.latency_ms = int((time.perf_counter() - started) * 1000)
+            return result
+        if discovered_account_id and not record.account_id:
+            record.account_id = discovered_account_id
+            record.account_email = discovered_account_email
+        record.monthly_spend_limit_usd = snap_data.monthly_spend_limit_usd
+        record.monthly_spend_used_usd = snap_data.monthly_spend_used_usd
+        record.balance_usd = snap_data.monthly_spend_remaining_usd
+        record.balance_updated_at = datetime.now(timezone.utc)
+
+    result.balance_usd = snap_data.monthly_spend_remaining_usd
+    result.monthly_spend_limit_usd = snap_data.monthly_spend_limit_usd
+    result.monthly_spend_used_usd = snap_data.monthly_spend_used_usd
+    if snap_data.monthly_spend_limit_usd > 0:
+        result.used_percent = snap_data.monthly_spend_used_usd / snap_data.monthly_spend_limit_usd * 100
+        result.balance_percent = result.balance_usd / snap_data.monthly_spend_limit_usd * 100
+    result.delta_balance_usd = result.balance_usd - prev_balance
+    result.delta_used_usd = snap_data.monthly_spend_used_usd - prev_used
+    result.suspend_state = snap_suspend_state
+    result.account_state = snap_account_state
+    result.ok = True
+    result.latency_ms = int((time.perf_counter() - started) * 1000)
+    return result
 
 
 async def refresh_balance_all() -> dict:
