@@ -1,51 +1,149 @@
+# ============================================================================
+# FireworkRouter 一键部署
+#
+# 启动：  docker compose up -d
+# 升级：  git pull && docker compose up -d --build
+# 备份：  bash scripts/backup.sh
+#
+# 服务：
+#   - api        FastAPI + Gunicorn × 4 worker，含 alembic 自动迁移、前端 SPA
+#   - postgres   主数据库 (15-alpine)
+#   - redis      可选，目前未强依赖
+#   - caddy      （可选 profile=https）反向代理 + 自动 HTTPS
+#
+# 所有敏感参数走 .env（git ignore）。首次部署：
+#   1) cp .env.example .env
+#   2) python scripts/bootstrap.py 'your-strong-password'
+#   3) （可选）改 DOMAIN 启用 caddy profile
+#   4) docker compose up -d
+# ============================================================================
+
 services:
-  api:
-    build: .
-    ports:
-      - "8000:8000"
-    environment:
-      - APP_ENV=production
-      - DATABASE_URL=postgresql+asyncpg://fwr:fwr@postgres:5432/fwr
-      - REDIS_URL=redis://redis:6379/0
-      - ADMIN_TOKEN=${ADMIN_TOKEN}
-      - UPSTREAM_KEY_FERNET_KEY=${UPSTREAM_KEY_FERNET_KEY}
-      - PROBE_INTERVAL_MINUTES=${PROBE_INTERVAL_MINUTES:-15}
-      - PROBE_MIN_BALANCE_USD=${PROBE_MIN_BALANCE_USD:-0.5}
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    volumes:
-      - ./data:/app/data
-    restart: unless-stopped
 
   postgres:
     image: postgres:15-alpine
+    container_name: fwr-postgres
+    restart: unless-stopped
     environment:
-      POSTGRES_USER: fwr
-      POSTGRES_PASSWORD: fwr
-      POSTGRES_DB: fwr
+      POSTGRES_USER: ${POSTGRES_USER:-fwr}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 未设置：请在 .env 里填写}
+      POSTGRES_DB: ${POSTGRES_DB:-fwr}
+      # 高并发参数（轻调优；可在 postgres.conf 里覆盖）
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      # 启动时执行的优化 SQL（首次运行才生效）
+      - ./scripts/postgres-init.sql:/docker-entrypoint-initdb.d/01-tune.sql:ro
+    command: >
+      postgres
+        -c shared_buffers=256MB
+        -c effective_cache_size=1GB
+        -c maintenance_work_mem=64MB
+        -c work_mem=8MB
+        -c max_connections=200
+        -c wal_compression=on
+        -c synchronous_commit=on
+        -c checkpoint_completion_target=0.9
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U fwr -d fwr"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-fwr} -d ${POSTGRES_DB:-fwr}"]
       interval: 5s
       timeout: 5s
-      retries: 5
-    restart: unless-stopped
+      retries: 10
+    # 只对内部网络暴露，宿主不映射端口（安全）
+    expose:
+      - "5432"
+    networks: [fwrnet]
 
   redis:
     image: redis:7-alpine
+    container_name: fwr-redis
+    restart: unless-stopped
+    command: redis-server --save "" --appendonly no --maxmemory 256mb --maxmemory-policy allkeys-lru
     volumes:
       - redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
-      timeout: 5s
+      timeout: 3s
       retries: 5
+    expose:
+      - "6379"
+    networks: [fwrnet]
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fwr-api
     restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      APP_ENV: production
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+      # 数据库：默认走 docker compose 内置 PostgreSQL；如需用外部 DB 在 .env 覆盖
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://${POSTGRES_USER:-fwr}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-fwr}}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+
+      # 鉴权 — bootstrap.py 生成
+      ADMIN_TOKEN: ${ADMIN_TOKEN:?ADMIN_TOKEN 未设置：请跑 python scripts/bootstrap.py 生成 .env}
+      ADMIN_PASSWORD_HASH: ${ADMIN_PASSWORD_HASH:?ADMIN_PASSWORD_HASH 未设置：请跑 python scripts/bootstrap.py 生成 .env}
+      UPSTREAM_KEY_FERNET_KEY: ${UPSTREAM_KEY_FERNET_KEY:?UPSTREAM_KEY_FERNET_KEY 未设置}
+      SESSION_TOKEN_SECRET: ${SESSION_TOKEN_SECRET:?SESSION_TOKEN_SECRET 未设置}
+      SESSION_TOKEN_TTL_HOURS: ${SESSION_TOKEN_TTL_HOURS:-24}
+
+      # 探针 & 调度
+      PROBE_INTERVAL_MINUTES: ${PROBE_INTERVAL_MINUTES:-15}
+      PROBE_CONCURRENCY: ${PROBE_CONCURRENCY:-20}
+      PROBE_MIN_BALANCE_USD: ${PROBE_MIN_BALANCE_USD:-0.5}
+      PROBE_ON_STARTUP: ${PROBE_ON_STARTUP:-false}
+      GATEWAY_MAX_RETRY_CREDENTIALS: ${GATEWAY_MAX_RETRY_CREDENTIALS:-3}
+      GATEWAY_MAX_RETRY_INTERVAL_S: ${GATEWAY_MAX_RETRY_INTERVAL_S:-30}
+      GATEWAY_DEFAULT_TIMEOUT_S: ${GATEWAY_DEFAULT_TIMEOUT_S:-180}
+
+      # 上游代理（可选，国内走代理才填）
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+
+    # data 目录只在 SQLite 模式下用得到；保留挂载点便于回退
+    volumes:
+      - ./data:/app/data
+    ports:
+      - "${API_BIND:-127.0.0.1}:${API_PORT:-8000}:8000"
+    networks: [fwrnet]
+
+  # ========== 可选：Caddy 自动 HTTPS（profiles 控制启停） ==========
+  # 启用方式（在 .env 设置 DOMAIN=your.domain.com 后）：
+  #   docker compose --profile https up -d
+  caddy:
+    image: caddy:2-alpine
+    container_name: fwr-caddy
+    restart: unless-stopped
+    profiles: ["https"]
+    depends_on:
+      - api
+    environment:
+      DOMAIN: ${DOMAIN:?启用 https profile 需在 .env 设置 DOMAIN=your.domain.com}
+      EMAIL: ${ACME_EMAIL:-}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./scripts/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks: [fwrnet]
 
 volumes:
   postgres_data:
   redis_data:
+  caddy_data:
+  caddy_config:
+
+networks:
+  fwrnet:
+    driver: bridge

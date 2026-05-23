@@ -1,0 +1,52 @@
+# FireworkRouter Caddy 反向代理 + 自动 HTTPS 配置
+#
+# Caddy 会自动从 Let's Encrypt 申请证书 + 自动续期。
+# 默认配置：
+#   - HTTP 80 自动跳 HTTPS 443
+#   - gzip 压缩
+#   - 关闭 SSE 缓冲（流式响应必须）
+#   - 长超时（大模型响应慢）
+
+{
+    email {$EMAIL}
+}
+
+{$DOMAIN} {
+    encode gzip zstd
+
+    reverse_proxy fwr-api:8000 {
+        # SSE 流式响应：必须关掉所有 buffer
+        flush_interval -1
+
+        # 长响应（大模型 + 流式可能跑十几分钟）
+        transport http {
+            response_header_timeout 180s
+            read_timeout 1800s
+            write_timeout 1800s
+            dial_timeout 10s
+        }
+
+        header_up X-Forwarded-Proto {scheme}
+        header_up X-Real-IP {remote_host}
+    }
+
+    # 安全头
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options nosniff
+        X-Frame-Options DENY
+        Referrer-Policy strict-origin-when-cross-origin
+        -Server
+    }
+
+    # 上传大小限制（图像 / 音频转写可能要传 MB 级文件）
+    request_body {
+        max_size 100MB
+    }
+
+    log {
+        output stdout
+        format json
+        level INFO
+    }
+}

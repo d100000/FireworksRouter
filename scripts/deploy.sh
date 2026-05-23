@@ -1,144 +1,186 @@
 #!/bin/bash
-# FireworkRouter 一键部署脚本（Docker Compose 模式）
-# 用法：bash scripts/deploy.sh
-# 或：  curl -fsSL https://raw.githubusercontent.com/d100000/FireworksRouter/main/scripts/deploy.sh | bash
+# ============================================================================
+# FireworkRouter 一键部署脚本（Docker Compose + PostgreSQL）
+#
+# 用法：
+#   bash scripts/deploy.sh
+#   或：curl -fsSL https://raw.githubusercontent.com/d100000/FireworksRouter/main/scripts/deploy.sh | bash
+#
+# 全程交互式：
+#   1) 安装 Docker（如果没装）
+#   2) 克隆 / 更新代码到 /opt/FireworksRouter
+#   3) 询问初始密码 → 生成 .env（含 PG 密码、加密 key、JWT secret）
+#   4) docker compose up -d --build（PostgreSQL + Redis + API）
+#   5) 健康检查直到 API 就绪
+#   6) 可选启用 Caddy HTTPS（输入域名即可）
+# ============================================================================
 
 set -e
 
-REPO="https://github.com/d100000/FireworksRouter.git"
+REPO="${REPO:-https://github.com/d100000/FireworksRouter.git}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/FireworksRouter}"
 
-# ============== 颜色输出 ==============
+# 颜色
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-info()    { echo -e "${BLUE}[INFO]${NC}  $*"; }
-ok()      { echo -e "${GREEN}[ OK ]${NC} $*"; }
-warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
-fail()    { echo -e "${RED}[FAIL]${NC} $*" >&2; exit 1; }
+info()  { echo -e "${BLUE}[INFO]${NC}  $*"; }
+ok()    { echo -e "${GREEN}[ OK ]${NC} $*"; }
+warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
+fail()  { echo -e "${RED}[FAIL]${NC} $*" >&2; exit 1; }
 
 # ============== 1. 环境检查 ==============
-info "检查系统..."
+info "检查系统环境..."
+
+# Docker
 if ! command -v docker >/dev/null 2>&1; then
     warn "未安装 Docker，正在安装..."
-    curl -fsSL https://get.docker.com | sudo bash
-    sudo usermod -aG docker "$USER"
-    warn "Docker 装好了，但需要重新登录让 docker group 生效。继续前请退出 ssh 重连。"
-    exit 0
-fi
-docker compose version >/dev/null || fail "docker compose 不可用，请升级 Docker 到 v20.10+"
-ok "Docker $(docker version --format '{{.Server.Version}}') + Compose $(docker compose version --short)"
-
-# Node.js 检查（构建前端）
-if ! command -v node >/dev/null 2>&1; then
-    warn "未装 Node.js（构建前端需要 Node 20+）"
-    read -p "  是否自动装 Node 20？ [Y/n] " yn
-    yn=${yn:-Y}
-    if [[ "$yn" =~ ^[Yy]$ ]]; then
-        curl -fsSL https://deb.nodesource.com/setup_20.x | sudo bash -
-        sudo apt-get install -y nodejs
+    if [ "$(id -u)" -ne 0 ]; then
+        curl -fsSL https://get.docker.com | sudo bash
+        sudo usermod -aG docker "$USER" 2>/dev/null || true
+        warn "Docker 安装完毕。你可能需要 ${YELLOW}重新登录 SSH${NC} 后再运行此脚本（让 docker group 生效）。"
+        warn "或者用 sudo 重新运行：sudo bash $0"
+        exit 0
     else
-        fail "请手动装 Node 20+ 后重试"
+        curl -fsSL https://get.docker.com | bash
     fi
 fi
-ok "Node $(node -v)"
 
-# ============== 2. 克隆代码 ==============
+# Compose v2
+if ! docker compose version >/dev/null 2>&1; then
+    fail "docker compose v2 不可用。请升级到 Docker 20.10+ 或安装 docker-compose-plugin。"
+fi
+
+DOCKER_VER=$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo "?")
+COMPOSE_VER=$(docker compose version --short 2>/dev/null || echo "?")
+ok "Docker ${DOCKER_VER} + Compose ${COMPOSE_VER}"
+
+# Git
+if ! command -v git >/dev/null 2>&1; then
+    info "安装 git..."
+    sudo apt-get update >/dev/null && sudo apt-get install -y -qq git
+fi
+
+# ============== 2. 克隆 / 更新代码 ==============
 if [ -d "$INSTALL_DIR/.git" ]; then
-    info "代码已存在，更新到最新..."
+    info "代码已存在，拉取最新..."
     cd "$INSTALL_DIR"
-    git pull origin main
+    git pull --ff-only origin main || warn "git pull 失败，可能有本地未提交修改"
 else
     info "克隆代码到 $INSTALL_DIR..."
-    sudo mkdir -p "$INSTALL_DIR"
-    sudo chown -R "$USER:$USER" "$INSTALL_DIR"
-    git clone "$REPO" "$INSTALL_DIR"
+    sudo mkdir -p "$(dirname "$INSTALL_DIR")"
+    if [ ! -w "$(dirname "$INSTALL_DIR")" ]; then
+        sudo chown -R "$USER:$USER" "$(dirname "$INSTALL_DIR")" 2>/dev/null || true
+    fi
+    git clone "$REPO" "$INSTALL_DIR" || fail "git clone 失败"
     cd "$INSTALL_DIR"
 fi
 ok "代码就绪：$(git log --oneline -1)"
 
-# ============== 3. 生成 .env ==============
+# ============== 3. 生成 .env（如不存在）==============
 if [ -f .env ]; then
-    warn ".env 已存在，跳过生成（如需重置，请先 rm .env）"
+    warn ".env 已存在，跳过生成（如需重置：mv .env .env.old）"
 else
-    echo
-    read -p "  请输入管理后台初始登录密码（至少 8 位）: " -s PASSWORD
-    echo
-    if [ ${#PASSWORD} -lt 8 ]; then fail "密码至少 8 位"; fi
-
-    read -p "  请输入 PostgreSQL 密码（用于内置 PG）: " -s PG_PASSWORD
-    echo
-    if [ ${#PG_PASSWORD} -lt 8 ]; then fail "PG 密码至少 8 位"; fi
+    info "首次部署：需要设置初始管理密码"
+    while true; do
+        read -p "  请输入管理后台初始登录密码（≥ 8 位）: " -s PASSWORD
+        echo
+        if [ "${#PASSWORD}" -ge 8 ]; then break; fi
+        warn "密码至少 8 位"
+    done
 
     info "生成 .env 文件..."
-    # 创建一次性 Python venv 跑 bootstrap.py
-    python3 -m venv /tmp/fwr-bootstrap-venv
-    /tmp/fwr-bootstrap-venv/bin/pip install cryptography passlib bcrypt -q
-    /tmp/fwr-bootstrap-venv/bin/python scripts/bootstrap.py "$PASSWORD"
-    rm -rf /tmp/fwr-bootstrap-venv
+    # 在临时 venv 跑 bootstrap.py（不污染系统 python）
+    VENV_DIR=$(mktemp -d)/fwr-bootstrap
+    python3 -m venv "$VENV_DIR" 2>/dev/null || python3.11 -m venv "$VENV_DIR" 2>/dev/null \
+        || fail "需要 python3，请先 apt install python3-venv"
+    "$VENV_DIR/bin/pip" install -q cryptography passlib bcrypt
+    "$VENV_DIR/bin/python" scripts/bootstrap.py "$PASSWORD"
+    rm -rf "$VENV_DIR"
 
-    # 把 DATABASE_URL 改为 PostgreSQL
-    sed -i.bak "s|DATABASE_URL=sqlite+aiosqlite:.*|DATABASE_URL=postgresql+asyncpg://fwr:${PG_PASSWORD}@postgres:5432/fwr|" .env
-    rm -f .env.bak
-
-    # 同步 PG 密码到 docker-compose.yml
-    sed -i.bak "s|POSTGRES_PASSWORD: fwr|POSTGRES_PASSWORD: ${PG_PASSWORD}|" docker-compose.yml
-    rm -f docker-compose.yml.bak
-
+    # 可选：HTTPS 配置
+    echo
+    read -p "  是否启用 HTTPS（Caddy 自动证书）？需要解析了的域名 [y/N]: " enable_https
+    if [[ "$enable_https" =~ ^[Yy]$ ]]; then
+        read -p "  请输入你的域名（如 fwr.example.com）: " DOMAIN
+        read -p "  请输入 ACME 注册邮箱（用于 Let's Encrypt 通知）: " ACME_EMAIL
+        echo "DOMAIN=${DOMAIN}" >> .env
+        echo "ACME_EMAIL=${ACME_EMAIL}" >> .env
+        echo "API_BIND=127.0.0.1" >> .env   # Caddy 反代，API 不必外网
+        ENABLE_HTTPS=1
+    else
+        # 没启用 HTTPS：让 API 直接对外（仅测试用）
+        sed -i.bak 's/^API_BIND=.*/API_BIND=0.0.0.0/' .env || true
+        rm -f .env.bak
+        ENABLE_HTTPS=0
+    fi
     ok ".env 生成完毕"
 fi
 
-# ============== 4. 构建前端 ==============
-info "安装前端依赖（约 1-2 分钟）..."
-cd frontend
-npm install --silent
-info "构建前端 SPA..."
-npm run build
-cd ..
-ok "前端构建完成（$(du -sh frontend/dist | cut -f1)）"
+# ============== 4. 启动 Docker 服务 ==============
+info "拉取镜像 + 构建 + 启动..."
+COMPOSE_ARGS=""
+if grep -q '^DOMAIN=' .env 2>/dev/null && [ -n "$(grep '^DOMAIN=' .env | cut -d= -f2)" ]; then
+    COMPOSE_ARGS="--profile https"
+    info "检测到 DOMAIN 配置：将启用 Caddy HTTPS"
+fi
 
-# ============== 5. 启动 ==============
-info "启动 Docker 服务..."
-docker compose pull postgres redis
-docker compose up -d --build
+docker compose ${COMPOSE_ARGS} pull postgres redis 2>/dev/null || true
+docker compose ${COMPOSE_ARGS} up -d --build
 
-info "等待 API 启动（约 10-30 秒）..."
-for i in {1..30}; do
-    if curl -sf http://127.0.0.1:8000/healthz >/dev/null 2>&1; then
-        ok "API 启动成功！"
+# ============== 5. 健康检查 ==============
+info "等待 API 启动（最多 60 秒）..."
+HEALTH_OK=0
+for i in $(seq 1 60); do
+    if docker compose exec -T api curl -fsS http://127.0.0.1:8000/healthz >/dev/null 2>&1; then
+        HEALTH_OK=1
         break
     fi
     sleep 1
-    [ "$i" = "30" ] && fail "API 启动超时，检查 'docker compose logs api'"
 done
+if [ "$HEALTH_OK" = "0" ]; then
+    warn "API 启动超时，检查日志：docker compose logs api"
+    docker compose logs --tail 50 api
+    exit 1
+fi
+ok "API 启动成功 ✓"
 
 # ============== 6. 完成 ==============
+HOSTIP=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "127.0.0.1")
+DOMAIN_LINE=$(grep '^DOMAIN=' .env 2>/dev/null | cut -d= -f2 || echo "")
+
 echo
 echo "═══════════════════════════════════════════════════════════════"
 echo
 echo "  🎆 FireworkRouter 部署完成！"
 echo
-echo "  访问后台：  http://$(hostname -I | awk '{print $1}'):8000/"
-echo "             或 http://127.0.0.1:8000/"
-echo "  初始密码：  你刚才输入的"
+if [ -n "$DOMAIN_LINE" ]; then
+    echo "  🔒 HTTPS 访问： https://${DOMAIN_LINE}/"
+    echo "  📋 首次访问前确保 ${DOMAIN_LINE} 的 A 记录指向本机 IP"
+    echo "  📋 Caddy 会自动从 Let's Encrypt 申请证书（首次约 30 秒）"
+else
+    echo "  访问： http://${HOSTIP}:8000/   或   http://127.0.0.1:8000/"
+    echo "  ⚠️  目前是 HTTP 明文，生产建议加 HTTPS（编辑 .env 加 DOMAIN）"
+fi
 echo
 echo "  下一步推荐："
-echo "    1. 配置 HTTPS（Caddy/Nginx，见 docs/DEPLOYMENT.md 第五节）"
+echo "    1. 登录修改默认密码（右上角头像 → 修改密码）"
 echo "    2. 添加上游 Fireworks Key（菜单「上游 Key 池」）"
 echo "    3. 同步价格表（菜单「价格表」→ 从 LiteLLM 同步）"
 echo "    4. 启用模型（菜单「模型管理」）"
 echo "    5. 颁发下游 API Key（菜单「API Keys」→ 新建）"
 echo
-echo "  数据备份命令："
-echo "    bash $INSTALL_DIR/scripts/backup.sh"
+echo "  常用命令："
+echo "    日志：    docker compose logs -f api"
+echo "    重启：    docker compose restart api"
+echo "    升级：    cd ${INSTALL_DIR} && git pull && docker compose up -d --build"
+echo "    备份：    bash ${INSTALL_DIR}/scripts/backup.sh"
+echo "    备份计划任务：sudo crontab -e  添加：0 3 * * * bash ${INSTALL_DIR}/scripts/backup.sh"
 echo
-echo "  升级命令："
-echo "    cd $INSTALL_DIR && git pull && docker compose up -d --build"
-echo
-echo "  完整文档：  $INSTALL_DIR/docs/DEPLOYMENT.md"
-echo "  GitHub：    https://github.com/d100000/FireworksRouter"
+echo "  完整文档：${INSTALL_DIR}/docs/DEPLOYMENT.md"
+echo "  GitHub：  https://github.com/d100000/FireworksRouter"
 echo
 echo "═══════════════════════════════════════════════════════════════"
