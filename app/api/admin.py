@@ -291,6 +291,7 @@ async def refresh_balance_one(key_id: int) -> dict[str, Any]:
     - 不会因为余额低 / suspendState 而把 Key 标记为 auto_disabled
     - 不写 ProbeHistory（不污染探针日志）
     - 返回新旧余额对比 + 占用率，方便 UI 直观展示
+    - status=disabled / enabled=false 的 Key 直接跳过（skipped=true）
     """
     result = await balance_svc.refresh_balance_one(key_id)
     if result is None:
@@ -299,6 +300,7 @@ async def refresh_balance_one(key_id: int) -> dict[str, Any]:
         "key_id": result.key_id,
         "key_preview": result.key_preview,
         "ok": result.ok,
+        "skipped": result.skipped,
         "previous_balance_usd": result.previous_balance_usd,
         "previous_used_usd": result.previous_used_usd,
         "balance_usd": result.balance_usd,
@@ -311,6 +313,8 @@ async def refresh_balance_one(key_id: int) -> dict[str, Any]:
         "suspend_state": result.suspend_state,
         "account_state": result.account_state,
         "error": result.error,
+        "error_type": result.error_type,
+        "suggestion": result.suggestion,
         "latency_ms": result.latency_ms,
     }
 

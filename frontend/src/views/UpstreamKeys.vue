@@ -245,23 +245,33 @@ const columns = [
   },
   {
     title: '操作', key: 'actions', fixed: 'right', width: 360,
-    render: (row) => h(NSpace, { size: 'small' }, () => [
-      h(NButton, { size: 'tiny', type: 'primary', onClick: () => openDetail(row) }, () => '详情'),
-      h(NButton, {
-        size: 'tiny', type: 'primary', ghost: true,
-        loading: refreshingIds.value.has(row.id),
-        onClick: () => refreshBalance(row.id),
-      }, () => '更新余额'),
-      h(NButton, { size: 'tiny', onClick: () => probeOne(row.id) }, () => '探针'),
-      h(NButton, {
-        size: 'tiny', type: row.enabled ? 'warning' : 'primary',
-        onClick: () => toggleEnabled(row),
-      }, () => row.enabled ? '禁用' : '启用'),
-      h(NPopconfirm, { onPositiveClick: () => removeRow(row.id) }, {
-        default: () => '确认删除？',
-        trigger: () => h(NButton, { size: 'tiny', type: 'error' }, () => '删除'),
-      }),
-    ]),
+    render: (row) => {
+      const isDisabled = !row.enabled || row.status === 'disabled'
+      return h(NSpace, { size: 'small' }, () => [
+        h(NButton, { size: 'tiny', type: 'primary', onClick: () => openDetail(row) }, () => '详情'),
+        h(NButton, {
+          size: 'tiny', type: 'primary', ghost: true,
+          disabled: isDisabled,
+          loading: refreshingIds.value.has(row.id),
+          title: isDisabled ? 'Key 已禁用，请先启用后再查询' : '查询并更新余额',
+          onClick: () => refreshBalance(row.id),
+        }, () => '更新余额'),
+        h(NButton, {
+          size: 'tiny',
+          disabled: isDisabled,
+          title: isDisabled ? 'Key 已禁用，请先启用后再探针' : '探针（含状态决策）',
+          onClick: () => probeOne(row.id),
+        }, () => '探针'),
+        h(NButton, {
+          size: 'tiny', type: row.enabled ? 'warning' : 'primary',
+          onClick: () => toggleEnabled(row),
+        }, () => row.enabled ? '禁用' : '启用'),
+        h(NPopconfirm, { onPositiveClick: () => removeRow(row.id) }, {
+          default: () => '确认删除？',
+          trigger: () => h(NButton, { size: 'tiny', type: 'error' }, () => '删除'),
+        }),
+      ])
+    },
   },
 ]
 
@@ -352,6 +362,20 @@ async function probeOne(id) {
   }
 }
 
+// 错误类型 → 中文标签
+const ERR_TYPE_LABEL = {
+  unauthorized: '401 Key 失效',
+  forbidden: '403 账户暂停',
+  not_found: '404 资源缺失',
+  rate_limited: '429 限频',
+  timeout: '超时',
+  network: '网络',
+  no_account: '无可用账户',
+  upstream_error: '上游错误',
+  key_disabled: '已禁用',
+  unknown: '未知',
+}
+
 async function refreshBalance(id) {
   refreshingIds.value.add(id)
   try {
@@ -365,8 +389,19 @@ async function refreshBalance(id) {
         `${data.key_preview}: $${data.balance_usd.toFixed(4)} / $${data.monthly_spend_limit_usd.toFixed(0)} (${data.balance_percent.toFixed(1)}%) ${deltaStr} · ${data.latency_ms}ms`,
         { duration: 6000 },
       )
+    } else if (data.skipped) {
+      // Key 已禁用，主动跳过 — info 而非 error
+      message.info(
+        `${data.key_preview}: ${data.error}${data.suggestion ? `（${data.suggestion}）` : ''}`,
+        { duration: 6000 },
+      )
     } else {
-      message.error(`${data.key_preview} 余额查询失败: ${data.error}`, { duration: 8000 })
+      // 真正失败 — 显示友好错误 + 修复建议
+      const friendly = data.error || '余额查询失败'
+      message.error(
+        `${data.key_preview}: ${friendly}${data.suggestion ? `\n💡 ${data.suggestion}` : ''}`,
+        { duration: 10000 },
+      )
     }
     await load()
   } catch (e) {
@@ -381,16 +416,31 @@ async function refreshAllBalances() {
   refreshingAll.value = true
   try {
     const { data } = await upstreamApi.refreshBalancesAll()
-    const failedDetail = data.items.filter(i => !i.ok)
-    if (failedDetail.length === 0) {
+    const ok = data.ok || 0
+    const fail = data.fail || 0
+    const skipped = data.skipped || 0
+    const totalBalanceStr = `$${(data.total_balance_usd || 0).toFixed(2)}`
+
+    // 按 error_type 聚合摘要（如 "3 把 401 / 2 把超时"）
+    const errSummary = Object.entries(data.error_summary || {})
+      .map(([t, n]) => `${n} 把${ERR_TYPE_LABEL[t] || t}`)
+      .join(' · ')
+
+    if (fail === 0 && skipped === 0) {
       message.success(
-        `🎉 ${data.ok}/${data.total} 把 Key 余额已更新，总余额 $${data.total_balance_usd.toFixed(2)} · ${data.ms}ms`,
+        `🎉 ${ok}/${data.total} 把 Key 余额已更新 · 总余额 ${totalBalanceStr} · ${data.ms}ms`,
+        { duration: 6000 },
+      )
+    } else if (fail === 0) {
+      message.success(
+        `✓ 更新 ${ok} 把 · 跳过 ${skipped} 把禁用 · 总余额 ${totalBalanceStr} · ${data.ms}ms`,
         { duration: 6000 },
       )
     } else {
       message.warning(
-        `成功 ${data.ok} / 失败 ${data.fail} / 总余额 $${data.total_balance_usd.toFixed(2)}，失败 Key: ${failedDetail.slice(0, 3).map(i => i.key_preview).join(', ')}`,
-        { duration: 8000 },
+        `成功 ${ok} / 失败 ${fail}${skipped ? ` / 跳过 ${skipped}` : ''} · 总余额 ${totalBalanceStr}` +
+        (errSummary ? `\n失败原因：${errSummary}` : ''),
+        { duration: 10000 },
       )
     }
     await load()
