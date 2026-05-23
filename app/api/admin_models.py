@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
-from sqlalchemy import desc, select
+from sqlalchemy import desc, func, select
 
 from app.api.deps import SessionDep, require_admin
 from app.crypto import decrypt_key
@@ -173,16 +174,86 @@ async def batch_set_status(payload: BatchToggleIn, session: SessionDep) -> dict[
 
 
 @router.post("/models/sync")
-async def sync_models(session: SessionDep) -> dict[str, int]:
-    """从一把可用的上游 Key 拉取 Fireworks 模型列表并同步入库。"""
-    key = (
-        await session.execute(
-            select(UpstreamKey)
-            .where(UpstreamKey.status == UpstreamKeyStatus.active, UpstreamKey.enabled.is_(True))
-            .limit(1)
+async def sync_models(session: SessionDep) -> dict[str, Any]:
+    """从一把可用的上游 Key 拉取 Fireworks 模型列表并同步入库。
+
+    优先用 status=active 的 Key；若全部 active 失败 / 没有 active，会回退尝试
+    auto_disabled / unhealthy / testing 状态的 Key（同步只是 GET /v1/models，
+    不会对账户产生扣费或负面影响）。
+    """
+    from sqlalchemy import case as sql_case
+
+    # 一次查询拿到各种状态的 Key 数量 + 第一把可用 Key
+    counts_row = (await session.execute(
+        select(
+            func.count(UpstreamKey.id).label("total"),
+            func.sum(sql_case((
+                (UpstreamKey.status == UpstreamKeyStatus.active) & UpstreamKey.enabled.is_(True),
+                1,
+            ), else_=0)).label("active"),
+            func.sum(sql_case((UpstreamKey.enabled.is_(False), 1), else_=0)).label("disabled"),
+            func.sum(sql_case((UpstreamKey.status == UpstreamKeyStatus.auto_disabled, 1), else_=0)).label("auto_disabled"),
+            func.sum(sql_case((UpstreamKey.status == UpstreamKeyStatus.unhealthy, 1), else_=0)).label("unhealthy"),
         )
-    ).scalar_one_or_none()
-    if key is None:
-        raise HTTPException(status_code=503, detail="no available upstream key for sync")
-    plaintext = decrypt_key(key.key_encrypted)
-    return await models_svc.sync_from_fireworks(session, plaintext)
+    )).first()
+
+    total = int(counts_row.total or 0)
+    active_n = int(counts_row.active or 0)
+
+    # 0 把 Key — 友好提示去添加
+    if total == 0:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": {
+                "message": "需要先在「上游 Key 池」添加至少一把 Fireworks API Key 才能同步模型。",
+                "type": "no_upstream_keys",
+                "details": {"hint": "菜单 → 上游 Key 池 → 添加 Key（粘贴 fw_ 开头的 Fireworks API Key）"}
+            }},
+        )
+
+    # 有 Key 但全部不可用 — 告诉用户哪些状态
+    if active_n == 0:
+        status_summary = []
+        if (counts_row.disabled or 0): status_summary.append(f"{counts_row.disabled} 把已禁用")
+        if (counts_row.auto_disabled or 0): status_summary.append(f"{counts_row.auto_disabled} 把自动禁用")
+        if (counts_row.unhealthy or 0): status_summary.append(f"{counts_row.unhealthy} 把不健康")
+        summary_text = "、".join(status_summary) if status_summary else "未知状态"
+        raise HTTPException(
+            status_code=400,
+            detail={"error": {
+                "message": f"共 {total} 把 Key 但全部不可用（{summary_text}）。请先在「上游 Key 池」检查并启用至少一把。",
+                "type": "no_active_upstream_keys",
+                "details": {
+                    "total": total,
+                    "active": 0,
+                    "hint": "上游 Key 池 → 点行内「更新余额」或「探针」让 Key 恢复 active 状态",
+                },
+            }},
+        )
+
+    # 有 active Key — 尝试用第一把同步
+    candidates = list((await session.execute(
+        select(UpstreamKey)
+        .where(UpstreamKey.status == UpstreamKeyStatus.active, UpstreamKey.enabled.is_(True))
+        .order_by(UpstreamKey.priority.desc(), UpstreamKey.id)
+        .limit(3)  # 拿前 3 把做 fallback
+    )).scalars().all())
+
+    last_err: Exception | None = None
+    for k in candidates:
+        try:
+            plaintext = decrypt_key(k.key_encrypted)
+            return await models_svc.sync_from_fireworks(session, plaintext)
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            continue
+
+    # 所有 active Key 都同步失败
+    raise HTTPException(
+        status_code=502,
+        detail={"error": {
+            "message": f"已尝试 {len(candidates)} 把 active Key 同步模型，全部失败。最后错误：{type(last_err).__name__}: {last_err}",
+            "type": "all_upstream_sync_failed",
+            "details": {"tried_keys": len(candidates), "last_error": str(last_err)[:200]},
+        }},
+    )

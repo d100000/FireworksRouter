@@ -95,11 +95,14 @@
 
 <script setup>
 import { ref, h, onMounted, reactive } from 'vue'
-import { NTag, NButton, NPopconfirm, NSpace, useMessage } from 'naive-ui'
+import { useRouter } from 'vue-router'
+import { NTag, NButton, NPopconfirm, NSpace, useMessage, useDialog } from 'naive-ui'
 import { modelApi } from '@/api'
 import StatusDot from '@/components/StatusDot.vue'
 
 const message = useMessage()
+const dialog = useDialog()
+const router = useRouter()
 const rows = ref([])
 const loading = ref(false)
 const syncing = ref(false)
@@ -175,10 +178,51 @@ async function sync() {
   syncing.value = true
   try {
     const { data } = await modelApi.sync()
-    message.success(`同步完成：新增 ${data.created} / 更新 ${data.updated} / 共 ${data.total}`)
+    const priced = data.priced ?? 0
+    const unpriced = data.unpriced ?? 0
+    message.success(
+      `🎉 同步完成：新增 ${data.created} / 更新 ${data.updated} / 共 ${data.total}` +
+      (priced ? ` · 自动填价 ${priced}` : '') +
+      (unpriced ? ` · ${unpriced} 个待手动填价` : ''),
+      { duration: 6000 },
+    )
     await load()
   } catch (e) {
-    message.error(e?.response?.data?.detail || '同步失败')
+    // 后端返回的错误体可能有多种形态：
+    //   1) {detail: {error: {message, type, details}}}  ← 新版结构化错误
+    //   2) {error: {message, ...}}                       ← APIError 中间件
+    //   3) {detail: "..."}                               ← 老版 HTTPException 字符串
+    const detail = e?.response?.data?.detail
+    const err = e?.response?.data?.error || detail?.error
+    if (err?.type === 'no_upstream_keys') {
+      dialog.warning({
+        title: '需要先添加 Fireworks Key',
+        content: () => h('div', [
+          h('p', { style: 'margin: 0 0 12px 0' }, err.message),
+          err.details?.hint && h('p', { style: 'margin: 0; color: var(--n-text-color-3, #64748b); font-size: 12px' }, err.details.hint),
+        ]),
+        positiveText: '去添加 Key',
+        negativeText: '关闭',
+        onPositiveClick: () => router.push('/upstream-keys'),
+      })
+    } else if (err?.type === 'no_active_upstream_keys') {
+      dialog.warning({
+        title: 'Key 池中无可用 Key',
+        content: () => h('div', [
+          h('p', { style: 'margin: 0 0 12px 0' }, err.message),
+          err.details?.hint && h('p', { style: 'margin: 0; color: var(--n-text-color-3, #64748b); font-size: 12px' }, err.details.hint),
+        ]),
+        positiveText: '去 Key 池',
+        negativeText: '关闭',
+        onPositiveClick: () => router.push('/upstream-keys'),
+      })
+    } else if (err?.message) {
+      message.error(err.message, { duration: 6000 })
+    } else if (typeof detail === 'string') {
+      message.error(detail)
+    } else {
+      message.error('同步失败：' + (e.message || '未知错误'))
+    }
   } finally {
     syncing.value = false
   }
