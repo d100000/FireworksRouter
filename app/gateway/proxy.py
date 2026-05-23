@@ -215,9 +215,13 @@ async def _try_single(
     timeout: float,
     is_stream: bool,
 ) -> tuple[httpx.Response, httpx.AsyncClient] | None:
+    # 注：每请求新建 client 是为了让 stream 生命周期跟着请求走（流式时 client 必须
+    # 等到上游响应完成才能关）。如果需要更高吞吐，可以引入一个全局 connection pool
+    # （httpx.AsyncClient 内部已经做了 keep-alive；只要进程级别复用 transport 就行）。
     client = httpx.AsyncClient(
         timeout=httpx.Timeout(timeout, connect=10.0),
         proxy=settings.proxy_url,
+        limits=httpx.Limits(max_keepalive_connections=50, max_connections=200),
     )
     try:
         req = client.build_request(

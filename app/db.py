@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -24,6 +25,21 @@ if not _settings.is_sqlite:
     _engine_kwargs.update(pool_pre_ping=True, pool_size=20, max_overflow=40)
 
 engine = create_async_engine(_settings.database_url, **_engine_kwargs)
+
+
+# SQLite 性能调优：WAL + NORMAL sync + busy_timeout + larger cache
+# 在不切换到 PostgreSQL 之前，这套设置可把 SQLite 写吞吐提升 2-5×。
+if _settings.is_sqlite:
+    @event.listens_for(engine.sync_engine, "connect")
+    def _sqlite_pragmas(dbapi_conn, _conn_record):
+        cursor = dbapi_conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")           # 并发读 + 串行写
+        cursor.execute("PRAGMA synchronous=NORMAL")         # 比 FULL 快很多，安全性可接受
+        cursor.execute("PRAGMA busy_timeout=5000")          # 写锁等待 5s 而不是立即失败
+        cursor.execute("PRAGMA cache_size=-65536")          # 64MB cache（默认 2MB）
+        cursor.execute("PRAGMA temp_store=MEMORY")          # 临时表走内存
+        cursor.execute("PRAGMA foreign_keys=ON")            # 启用外键约束
+        cursor.close()
 
 SessionLocal = async_sessionmaker(
     engine,

@@ -26,6 +26,7 @@ DEFAULTS: dict[str, Any] = {
     "cooldown.429_max_seconds": 1800,
     "cooldown.5xx_initial_seconds": 60,
     "cooldown.5xx_max_seconds": 1800,
+    "logs_retention_days": 30,
 }
 
 _cache: dict[str, Any] = {}

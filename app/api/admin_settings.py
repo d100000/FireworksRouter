@@ -41,6 +41,7 @@ _ALLOWED_KEYS = {
     "cooldown.429_max_seconds",
     "cooldown.5xx_initial_seconds",
     "cooldown.5xx_max_seconds",
+    "logs_retention_days",
 }
 
 
