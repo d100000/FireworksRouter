@@ -47,10 +47,14 @@
       <n-text depth="3">每行一个 Key，可附 <code>,name</code> 后缀。</n-text>
       <n-input v-model:value="batchText" type="textarea" :rows="10" placeholder="fw_aaa,name-1
 fw_bbb,name-2
-fw_ccc" />
+fw_ccc" :disabled="batchLoading" />
+      <n-alert type="info" :show-icon="false" style="margin-top: 12px; font-size: 12px">
+        🚀 快速入库模式：每把 Key 先以 <code>testing</code> 状态入库（<1 秒），探针并发后台跑（10 并发）。
+        关闭弹窗后到列表页看 <code>testing → active</code> 自动切换。
+      </n-alert>
       <template #footer>
         <n-space justify="end">
-          <n-button @click="batchShow = false">取消</n-button>
+          <n-button @click="batchShow = false" :disabled="batchLoading">取消</n-button>
           <n-button type="primary" :loading="batchLoading" @click="submitBatch">导入</n-button>
         </n-space>
       </template>
@@ -347,10 +351,31 @@ async function submitBatch() {
   batchLoading.value = true
   try {
     const { data } = await upstreamApi.batchCreate({ keys: batchText.value })
-    message.success(`成功 ${data.created} / 重复 ${data.duplicated} / 失败 ${data.failed}`)
+    if (data.created > 0) {
+      message.success(`已入库 ${data.created} 把（探针后台跑），重复 ${data.duplicated} 把，失败 ${data.failed} 把`)
+    } else {
+      message.warning(`无新增 — 重复 ${data.duplicated} 把，失败 ${data.failed} 把`)
+    }
     batchShow.value = false
     await load()
+    // 列表自动 5s 刷新看探针进展
+    pollProbeProgress()
   } finally { batchLoading.value = false }
+}
+
+let pollTimer = null
+function pollProbeProgress() {
+  if (pollTimer) clearInterval(pollTimer)
+  let ticks = 0
+  pollTimer = setInterval(async () => {
+    ticks += 1
+    await load()
+    const stillTesting = rows.value.some(r => r.status === 'testing')
+    if (!stillTesting || ticks > 12) {
+      clearInterval(pollTimer)
+      pollTimer = null
+    }
+  }, 5000)
 }
 
 onMounted(load)

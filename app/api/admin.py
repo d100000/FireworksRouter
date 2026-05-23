@@ -167,21 +167,34 @@ async def create_upstream_key(payload: UpstreamKeyCreate, session: SessionDep):
 
 @router.post("/upstream-keys/batch", response_model=UpstreamKeyBatchResult)
 async def batch_create_upstream_keys(payload: UpstreamKeyBatchCreate, session: SessionDep):
+    """批量导入：快速入库（< 100ms）+ 后台异步并发探针（不阻塞响应）。
+
+    设计：
+    1. 同步遍历，每把 Key 只做加密 + 去重 + DB 写入（register_key_quick），不调上游
+    2. 收集所有新创建 Key 的 ID
+    3. 用 asyncio.create_task 派发后台任务，Semaphore(10) 限制并发探针
+    4. 立即返回结果（status=testing），前端列表 5s 自动刷新看 testing → active 切换
+    """
+    import asyncio
+
     items: list[UpstreamKeyBatchResultItem] = []
     created = 0
     duplicated = 0
     failed = 0
+    new_key_ids: list[int] = []
+
     lines = [ln.strip() for ln in payload.keys.splitlines() if ln.strip()]
     for ln in lines:
         parts = ln.split(",", 1)
         key = parts[0].strip()
         name = parts[1].strip() if len(parts) > 1 else None
         try:
-            r = await upstream_svc.register_key(session, key, name=name)
+            r = await upstream_svc.register_key_quick(session, key, name=name)
         except ValueError as e:
             items.append(UpstreamKeyBatchResultItem(key_preview=key[:10], created=False, error=str(e)))
             failed += 1
             continue
+
         if not r.created and r.note == "duplicate":
             duplicated += 1
             items.append(UpstreamKeyBatchResultItem(
@@ -191,7 +204,24 @@ async def batch_create_upstream_keys(payload: UpstreamKeyBatchCreate, session: S
             created += 1
             items.append(UpstreamKeyBatchResultItem(
                 key_preview=r.key.key_preview, created=True,
-                status=r.key.status.value, note=r.note))
+                status=r.key.status.value, note="探针中…"))
+            new_key_ids.append(r.key.id)
+
+    # commit 让后台任务能查到记录
+    await session.commit()
+
+    # 派发后台并发探针（限制 10 并发，避免 Fireworks 控制面压力）
+    if new_key_ids:
+        sem = asyncio.Semaphore(10)
+
+        async def _probe_one(kid: int) -> None:
+            async with sem:
+                await upstream_svc.probe_after_register(kid)
+
+        # 创建任务但不 await — 让 batch 端点立即返回
+        for kid in new_key_ids:
+            asyncio.create_task(_probe_one(kid))
+
     return UpstreamKeyBatchResult(
         total=len(lines), created=created, duplicated=duplicated, failed=failed, items=items
     )

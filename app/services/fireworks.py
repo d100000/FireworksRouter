@@ -35,9 +35,14 @@ class QuotaSnapshot:
     raw: list[dict[str, Any]]
 
 
-def _client(timeout: float = 30.0) -> httpx.AsyncClient:
+def _client(timeout: float = 15.0) -> httpx.AsyncClient:
+    """Fireworks 管理 API 客户端。
+
+    管理 API（accounts/quotas）一般 < 2s 响应，15s 超时已足够防御异常网络。
+    connect 5s 用于快速失败：连不上 Fireworks 控制面的话立即返回，不要拖到 10s。
+    """
     return httpx.AsyncClient(
-        timeout=httpx.Timeout(timeout, connect=10.0),
+        timeout=httpx.Timeout(timeout, connect=5.0),
         proxy=settings.proxy_url,
         http2=False,
     )
