@@ -54,17 +54,17 @@ RUN groupadd -r app && useradd -r -g app -d /app -s /sbin/nologin app \
  && chown -R app:app /app
 USER app
 
-EXPOSE 8000
+EXPOSE 8011
 
 # 健康检查 — 给 Docker / docker compose 用
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:8000/healthz || exit 1
+    CMD curl -fsS http://127.0.0.1:8011/healthz || exit 1
 
 # Gunicorn + Uvicorn worker × 4
 CMD ["gunicorn", \
      "-k", "uvicorn.workers.UvicornWorker", \
      "-w", "4", \
-     "-b", "0.0.0.0:8000", \
+     "-b", "0.0.0.0:8011", \
      "--access-logfile", "-", \
      "--error-logfile", "-", \
      "--timeout", "180", \

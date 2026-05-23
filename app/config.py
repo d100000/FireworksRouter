@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     )
 
     app_env: str = "development"
-    app_port: int = 8000
+    app_port: int = 8011
     log_level: str = "INFO"
 
     database_url: str = "sqlite+aiosqlite:///./data/fireworkrouter.db"

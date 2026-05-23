@@ -135,7 +135,7 @@ docker compose ${COMPOSE_ARGS} up -d --build
 info "等待 API 启动（最多 60 秒）..."
 HEALTH_OK=0
 for i in $(seq 1 60); do
-    if docker compose exec -T api curl -fsS http://127.0.0.1:8000/healthz >/dev/null 2>&1; then
+    if docker compose exec -T api curl -fsS http://127.0.0.1:8011/healthz >/dev/null 2>&1; then
         HEALTH_OK=1
         break
     fi
@@ -162,7 +162,7 @@ if [ -n "$DOMAIN_LINE" ]; then
     echo "  📋 首次访问前确保 ${DOMAIN_LINE} 的 A 记录指向本机 IP"
     echo "  📋 Caddy 会自动从 Let's Encrypt 申请证书（首次约 30 秒）"
 else
-    echo "  访问： http://${HOSTIP}:8000/   或   http://127.0.0.1:8000/"
+    echo "  访问： http://${HOSTIP}:8011/   或   http://127.0.0.1:8011/"
     echo "  ⚠️  目前是 HTTP 明文，生产建议加 HTTPS（编辑 .env 加 DOMAIN）"
 fi
 echo

@@ -33,7 +33,7 @@ fi
 ADMIN_TOKEN=$(grep '^ADMIN_TOKEN=' "$INSTALL_DIR/.env" | cut -d= -f2)
 if [ -n "$ADMIN_TOKEN" ]; then
     echo "[backup] exporting price catalog..."
-    curl -sf http://127.0.0.1:8000/admin/price-catalog/export-json \
+    curl -sf http://127.0.0.1:8011/admin/price-catalog/export-json \
         -H "Authorization: Bearer $ADMIN_TOKEN" \
         > "$BACKUP_DIR/price-catalog-${DATE}.json" || echo "  ⚠ price-catalog export skipped"
 fi

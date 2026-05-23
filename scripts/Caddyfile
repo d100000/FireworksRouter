@@ -14,7 +14,7 @@
 {$DOMAIN} {
     encode gzip zstd
 
-    reverse_proxy fwr-api:8000 {
+    reverse_proxy fwr-api:8011 {
         # SSE 流式响应：必须关掉所有 buffer
         flush_interval -1
 

@@ -1142,7 +1142,7 @@ audit_logs ─> users (actor)
 ```ini
 # 基础
 APP_ENV=production
-APP_PORT=8000
+APP_PORT=8011
 APP_SECRET=please-change-me
 LOG_LEVEL=INFO
 

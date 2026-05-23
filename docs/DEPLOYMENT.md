@@ -158,14 +158,14 @@ docker compose up -d --build api
 ### 8. 验证
 
 ```bash
-curl http://127.0.0.1:8000/healthz
+curl http://127.0.0.1:8011/healthz
 # {"status":"ok"}
 
-curl http://127.0.0.1:8000/system/info
+curl http://127.0.0.1:8011/system/info
 # {"service":"FireworkRouter", "version":"0.1.0", ...}
 ```
 
-浏览器打开 `http://你的服务器IP:8000/` → 用你刚才设的密码登录。
+浏览器打开 `http://你的服务器IP:8011/` → 用你刚才设的密码登录。
 
 ---
 
@@ -243,7 +243,7 @@ EnvironmentFile=/opt/FireworksRouter/.env
 ExecStart=/opt/FireworksRouter/.venv/bin/gunicorn \
     -k uvicorn.workers.UvicornWorker \
     -w 4 \
-    -b 127.0.0.1:8000 \
+    -b 127.0.0.1:8011 \
     --access-logfile - \
     --error-logfile - \
     --timeout 180 \
@@ -293,7 +293,7 @@ your-domain.example.com {
     encode gzip
 
     # SSE 流式响应必须关 buffer
-    reverse_proxy 127.0.0.1:8000 {
+    reverse_proxy 127.0.0.1:8011 {
         flush_interval -1
         transport http {
             response_header_timeout 180s
@@ -338,7 +338,7 @@ server {
     client_max_body_size 50M;   # 给 image/audio 上传留空间
 
     location / {
-        proxy_pass http://127.0.0.1:8000;
+        proxy_pass http://127.0.0.1:8011;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -381,7 +381,7 @@ sudo nginx -t && sudo systemctl reload nginx
 
 ```ini
 APP_ENV=production
-APP_PORT=8000
+APP_PORT=8011
 LOG_LEVEL=INFO
 
 # PostgreSQL（生产必备）
@@ -445,7 +445,7 @@ docker compose -f /opt/FireworksRouter/docker-compose.yml exec -T postgres \
 
 # 价格表导出（通过 API）
 ADMIN_TOKEN=$(grep '^ADMIN_TOKEN=' /opt/FireworksRouter/.env | cut -d= -f2)
-curl -s http://127.0.0.1:8000/admin/price-catalog/export-json \
+curl -s http://127.0.0.1:8011/admin/price-catalog/export-json \
     -H "Authorization: Bearer $ADMIN_TOKEN" \
     | gzip > "$BACKUP_DIR/price-catalog-$DATE.json.gz"
 
@@ -491,7 +491,7 @@ docker compose up -d --build api
 
 # 5. 验证
 docker compose logs api | tail -30
-curl http://127.0.0.1:8000/healthz
+curl http://127.0.0.1:8011/healthz
 ```
 
 ### 数据库迁移失败回滚
@@ -515,8 +515,8 @@ docker compose up -d --build api
 
 | 检查项 | 命令 |
 | --- | --- |
-| API 存活 | `curl http://127.0.0.1:8000/healthz` |
-| API 就绪 | `curl http://127.0.0.1:8000/readyz` |
+| API 存活 | `curl http://127.0.0.1:8011/healthz` |
+| API 就绪 | `curl http://127.0.0.1:8011/readyz` |
 | 探针运行 | 看 Dashboard「冷却中 / 总余额」 |
 | DB 连接 | `docker compose exec postgres pg_isready -U fwr` |
 
@@ -525,7 +525,7 @@ docker compose up -d --build api
 `/opt/FireworksRouter/scripts/healthcheck.sh`：
 ```bash
 #!/bin/bash
-if ! curl -fs --max-time 10 http://127.0.0.1:8000/healthz > /dev/null; then
+if ! curl -fs --max-time 10 http://127.0.0.1:8011/healthz > /dev/null; then
     # 发飞书 webhook（替换成你的）
     curl -X POST https://open.feishu.cn/open-apis/bot/v2/hook/XXX \
         -H "Content-Type: application/json" \
@@ -568,7 +568,7 @@ docker compose logs api --tail 100
 
 ```bash
 # 看错误码
-curl -v http://127.0.0.1:8000/v1/chat/completions \
+curl -v http://127.0.0.1:8011/v1/chat/completions \
     -H "Authorization: Bearer sk-fwr-..." \
     -d '{"model":"gpt-oss-120b","messages":[{"role":"user","content":"hi"}]}'
 
@@ -600,7 +600,7 @@ docker compose exec postgres psql -U fwr fwr -c \
 ### 容器无法启动 + 报"address already in use"
 
 ```bash
-sudo ss -tlnp | grep :8000   # 看谁占了 8000
+sudo ss -tlnp | grep :8011   # 看谁占了 8011
 sudo systemctl stop nginx    # 或别的占用者
 docker compose up -d
 ```
@@ -626,7 +626,7 @@ docker compose restart api
         └──────────────┬───────────────────┘
                        │
         ┌──────────────▼───────────────────┐
-        │  FastAPI / Gunicorn × 4 worker   │ :8000
+        │  FastAPI / Gunicorn × 4 worker   │ :8011
         │  + APScheduler 探针 / metrics    │
         └──┬─────────────────────────┬─────┘
            │                         │

@@ -113,7 +113,7 @@ services:
     volumes:
       - ./data:/app/data
     ports:
-      - "${API_BIND:-127.0.0.1}:${API_PORT:-8000}:8000"
+      - "${API_BIND:-127.0.0.1}:${API_PORT:-8011}:8011"
     networks: [fwrnet]
 
   # ========== 可选：Caddy 自动 HTTPS（profiles 控制启停） ==========
