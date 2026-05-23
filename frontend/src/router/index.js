@@ -11,6 +11,7 @@ const routes = [
       { path: 'dashboard', component: () => import('@/views/Dashboard.vue'), meta: { title: '概览' } },
       { path: 'upstream-keys', component: () => import('@/views/UpstreamKeys.vue'), meta: { title: '上游 Key 池' } },
       { path: 'models', component: () => import('@/views/Models.vue'), meta: { title: '模型管理' } },
+      { path: 'price-catalog', component: () => import('@/views/PriceCatalog.vue'), meta: { title: '价格表' } },
       { path: 'api-keys', component: () => import('@/views/ApiKeys.vue'), meta: { title: 'API Keys' } },
       { path: 'request-trace', component: () => import('@/views/RequestTrace.vue'), meta: { title: '调度轨迹' } },
       { path: 'request-logs', component: () => import('@/views/RequestLogs.vue'), meta: { title: '调用日志' } },

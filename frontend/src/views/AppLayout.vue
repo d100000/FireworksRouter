@@ -105,7 +105,7 @@ import {
   StatsChartOutline, KeyOutline, CubeOutline,
   DocumentTextOutline, PulseOutline, LockClosedOutline,
   LogOutOutline, SettingsOutline, MoonOutline, SunnyOutline,
-  GitNetworkOutline, ShieldCheckmarkOutline,
+  GitNetworkOutline, ShieldCheckmarkOutline, PricetagsOutline,
 } from '@vicons/ionicons5'
 
 const message = useMessage()
@@ -122,6 +122,7 @@ const menuOptions = [
   { label: '概览', key: '/dashboard', icon: renderIcon(StatsChartOutline) },
   { label: '上游 Key 池', key: '/upstream-keys', icon: renderIcon(KeyOutline) },
   { label: '模型管理', key: '/models', icon: renderIcon(CubeOutline) },
+  { label: '价格表', key: '/price-catalog', icon: renderIcon(PricetagsOutline) },
   { label: 'API Keys', key: '/api-keys', icon: renderIcon(LockClosedOutline) },
   { label: '调度轨迹', key: '/request-trace', icon: renderIcon(GitNetworkOutline) },
   { label: '调用日志', key: '/request-logs', icon: renderIcon(DocumentTextOutline) },

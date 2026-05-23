@@ -41,6 +41,16 @@ export const modelApi = {
   batchStatus: (ids, status) => api.post('/admin/models/batch-status', { ids, status }),
 }
 
+export const priceCatalogApi = {
+  list: (params) => api.get('/admin/price-catalog', { params }),
+  create: (data) => api.post('/admin/price-catalog', data),
+  update: (id, data) => api.patch(`/admin/price-catalog/${id}`, data),
+  delete: (id) => api.delete(`/admin/price-catalog/${id}`),
+  syncLitellm: (overwrite = false) =>
+    api.post('/admin/price-catalog/sync-litellm', null, { params: { overwrite_existing: overwrite } }),
+  seed: () => api.post('/admin/price-catalog/seed'),
+}
+
 export const logsApi = {
   requests: (params) => api.get('/admin/logs/requests', { params }),
   probes: (params) => api.get('/admin/logs/probes', { params }),

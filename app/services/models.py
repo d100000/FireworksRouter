@@ -7,9 +7,10 @@ from dataclasses import dataclass
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Model, ModelCategory, ModelStatus
+from app.models import Model, ModelCategory, ModelStatus, ModelPriceCatalog
 from app.services import fireworks as fw
-from app.services.known_prices import lookup_price
+from app.services import price_catalog as pc
+from app.services.known_prices import lookup_price as lookup_hardcoded_price
 
 
 @dataclass
@@ -92,11 +93,20 @@ async def sync_from_fireworks(session: AsyncSession, api_key: str) -> dict[str, 
         supports_vision = bool(it.get("supports_image_input"))
         supports_tools = bool(it.get("supports_tools"))
 
-        # 查已知价格表
-        price = lookup_price(path)
-        # 命中价格表即可自动启用（包括图像/嵌入这种 token 价为 0 的模型 —
-        # 它们按张/请求计费，由上游直接扣，本网关只代理）
-        has_known_entry = price is not None
+        # 查 DB 价格目录（多源）；DB 没有再 fallback 到 hardcoded KNOWN_PRICES
+        catalog_result = await pc.lookup_price(session, path)
+        catalog_row = catalog_result.record
+        if catalog_row is not None:
+            class _PriceShim:
+                input_per_1m = catalog_row.input_per_1m
+                output_per_1m = catalog_row.output_per_1m
+                cached_input_per_1m = catalog_row.cached_input_per_1m
+                note = catalog_row.note or f"From {catalog_row.source.value} (pattern={catalog_row.pattern})"
+            price = _PriceShim()
+            has_known_entry = True
+        else:
+            price = lookup_hardcoded_price(path)
+            has_known_entry = price is not None
 
         if existing is None:
             # 新增：命中已知表 → 自动 active；未命中 → disabled 等管理员填

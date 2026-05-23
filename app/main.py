@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app import __version__
 from app.api import admin as admin_api
-from app.api import admin_auth, admin_metrics, admin_models, admin_settings
+from app.api import admin_auth, admin_metrics, admin_models, admin_price_catalog, admin_settings
 from app.api import system as system_api
 from app.config import get_settings
 from app.db import init_db
@@ -32,6 +32,11 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     await init_db()
     from app.services.settings import load_all
     await load_all()
+    # 首次启动种子价格表（从 hardcoded KNOWN_PRICES）
+    from app.db import session_scope
+    from app.services import price_catalog as _pc
+    async with session_scope() as _s:
+        await _pc.seed_initial(_s)
     sched = start_scheduler()
     metrics_svc.start_workers()
 
@@ -94,6 +99,7 @@ app.include_router(anthropic_router.router)
 app.include_router(admin_auth.router)
 app.include_router(admin_api.router)
 app.include_router(admin_models.router)
+app.include_router(admin_price_catalog.router)
 app.include_router(admin_settings.router)
 app.include_router(admin_metrics.router)
 
