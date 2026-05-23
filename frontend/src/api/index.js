@@ -62,6 +62,16 @@ export const priceCatalogApi = {
 export const logsApi = {
   requests: (params) => api.get('/admin/logs/requests', { params }),
   probes: (params) => api.get('/admin/logs/probes', { params }),
+  // 系统日志（应用日志：loguru → DB）
+  systemList: (params) => api.get('/admin/system-logs', { params }),
+  systemBulkDelete: (filter) => api.post('/admin/system-logs/bulk-delete', filter),
+  // 调用日志批量删
+  requestBulkDelete: (filter) => api.post('/admin/request-logs/bulk-delete', filter),
+  // 探针历史批量删
+  probeBulkDelete: (filter) => api.post('/admin/probe-history/bulk-delete', filter),
+  // 清理状态 & 手动清理
+  cleanupStatus: () => api.get('/admin/cleanup/status'),
+  cleanupRunNow: () => api.post('/admin/cleanup/run-now'),
 }
 
 export const statsApi = {

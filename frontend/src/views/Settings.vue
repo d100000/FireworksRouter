@@ -91,6 +91,82 @@
       </n-form>
     </n-card>
 
+    <!-- ============ 日志保留 & 清理 ============ -->
+    <n-card title="日志保留 & 清理">
+      <n-form label-placement="left" label-width="220">
+        <n-grid :cols="2" x-gap="20">
+          <n-gi>
+            <n-form-item label="应用日志最低级别">
+              <n-select
+                v-model:value="form['system_log_min_level']"
+                :options="logLevelOpts"
+                style="width: 100%"
+              />
+            </n-form-item>
+            <n-form-item label="应用日志保留（天）">
+              <n-input-number v-model:value="form['system_logs_retention_days']" :min="1" :max="365" style="width: 100%" />
+            </n-form-item>
+            <n-form-item label="调用日志保留（天）">
+              <n-input-number v-model:value="form['logs_retention_days']" :min="1" :max="365" style="width: 100%" />
+            </n-form-item>
+          </n-gi>
+          <n-gi>
+            <n-form-item label="探针历史保留（天）">
+              <n-input-number v-model:value="form['probe_history_retention_days']" :min="1" :max="90" style="width: 100%" />
+            </n-form-item>
+            <n-form-item label="监控桶保留（小时）">
+              <n-input-number v-model:value="form['metric_buckets_retention_hours']" :min="1" :max="168" style="width: 100%" />
+            </n-form-item>
+          </n-gi>
+        </n-grid>
+        <n-alert type="info" :show-icon="false" style="margin-bottom: 12px">
+          应用日志（loguru）默认只把 <b>WARNING+</b> 写入 DB；INFO/DEBUG 只去 stdout 不入库。
+          后台每小时自动清理一次；下面的「立即清理」按钮立即执行一次。
+        </n-alert>
+
+        <!-- 表大小预览 -->
+        <n-descriptions
+          v-if="cleanupStatus"
+          label-placement="top"
+          :column="4"
+          size="small"
+          bordered
+          style="margin-bottom: 12px"
+        >
+          <n-descriptions-item label="应用日志">
+            <span class="mono">{{ cleanupStatus.tables.system_logs.rows }} 条</span>
+            <div class="muted small">{{ rangeOf('system_logs') }}</div>
+          </n-descriptions-item>
+          <n-descriptions-item label="调用日志">
+            <span class="mono">{{ cleanupStatus.tables.request_logs.rows }} 条</span>
+            <div class="muted small">{{ rangeOf('request_logs') }}</div>
+          </n-descriptions-item>
+          <n-descriptions-item label="探针历史">
+            <span class="mono">{{ cleanupStatus.tables.probe_history.rows }} 条</span>
+            <div class="muted small">{{ rangeOf('probe_history') }}</div>
+          </n-descriptions-item>
+          <n-descriptions-item label="监控桶">
+            <span class="mono">{{ cleanupStatus.tables.key_metric_buckets.rows }} 条</span>
+            <div class="muted small">{{ rangeOf('key_metric_buckets') }}</div>
+          </n-descriptions-item>
+        </n-descriptions>
+
+        <n-space>
+          <n-button @click="loadCleanupStatus" :loading="statusLoading">刷新表大小</n-button>
+          <n-popconfirm @positive-click="runCleanupNow" :show-icon="false">
+            <template #trigger>
+              <n-button type="warning" :loading="cleanupLoading">立即清理过期日志</n-button>
+            </template>
+            按当前保留期立即跑一次清理（删除超期数据）？
+          </n-popconfirm>
+          <span v-if="lastDeleted" class="muted small" style="align-self: center">
+            上次清理：app={{ lastDeleted.system_logs }} / req={{ lastDeleted.request_logs }} /
+            probe={{ lastDeleted.probe_history }} / 桶={{ lastDeleted.metric_buckets }}
+          </span>
+        </n-space>
+      </n-form>
+    </n-card>
+
     <n-space justify="end">
       <n-button @click="load">重置</n-button>
       <n-button type="primary" :loading="saving" @click="save">保存所有变更</n-button>
@@ -100,8 +176,8 @@
 
 <script setup>
 import { ref, onMounted, computed, reactive } from 'vue'
-import { useMessage } from 'naive-ui'
-import { settingsApi } from '@/api'
+import { useMessage, NPopconfirm, NDescriptions, NDescriptionsItem } from 'naive-ui'
+import { settingsApi, logsApi } from '@/api'
 
 const message = useMessage()
 
@@ -121,8 +197,26 @@ const form = reactive({
   'cooldown.429_max_seconds': 1800,
   'cooldown.5xx_initial_seconds': 60,
   'cooldown.5xx_max_seconds': 1800,
+  // 日志保留
+  'logs_retention_days': 30,
+  'system_logs_retention_days': 14,
+  'probe_history_retention_days': 7,
+  'metric_buckets_retention_hours': 25,
+  'system_log_min_level': 'WARNING',
 })
 const saving = ref(false)
+const cleanupStatus = ref(null)
+const statusLoading = ref(false)
+const cleanupLoading = ref(false)
+const lastDeleted = ref(null)
+
+const logLevelOpts = [
+  { label: 'DEBUG（最详细，量大）', value: 'DEBUG' },
+  { label: 'INFO（一般信息）', value: 'INFO' },
+  { label: 'WARNING（推荐，警告及以上）', value: 'WARNING' },
+  { label: 'ERROR（仅错误）', value: 'ERROR' },
+  { label: 'CRITICAL（仅严重错误）', value: 'CRITICAL' },
+]
 
 const strategyOpts = computed(() => strategies.value.map(v => ({ label: v, value: v })))
 
@@ -132,6 +226,42 @@ async function load() {
   for (const k of Object.keys(form)) {
     if (data.items[k] !== undefined) form[k] = data.items[k]
   }
+  await loadCleanupStatus()
+}
+
+async function loadCleanupStatus() {
+  statusLoading.value = true
+  try {
+    const { data } = await logsApi.cleanupStatus()
+    cleanupStatus.value = data
+  } catch (e) {
+    message.error(`加载表大小失败：${e?.message || e}`)
+  } finally {
+    statusLoading.value = false
+  }
+}
+
+async function runCleanupNow() {
+  cleanupLoading.value = true
+  try {
+    const { data } = await logsApi.cleanupRunNow()
+    lastDeleted.value = data.deleted
+    message.success(
+      `清理完成 — app:${data.deleted.system_logs}/req:${data.deleted.request_logs}/probe:${data.deleted.probe_history}/桶:${data.deleted.metric_buckets}`,
+    )
+    await loadCleanupStatus()
+  } catch (e) {
+    message.error(`清理失败：${e?.message || e}`)
+  } finally {
+    cleanupLoading.value = false
+  }
+}
+
+function rangeOf(table) {
+  const t = cleanupStatus.value?.tables?.[table]
+  if (!t || !t.oldest) return '—'
+  const fmt = (s) => new Date(s).toLocaleDateString('zh-CN')
+  return `${fmt(t.oldest)} ~ ${fmt(t.newest)}`
 }
 
 async function save() {
@@ -147,3 +277,16 @@ async function save() {
 
 onMounted(load)
 </script>
+
+<style scoped>
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-weight: 600;
+}
+.muted {
+  color: var(--n-text-color-3, #888);
+}
+.small {
+  font-size: 12px;
+}
+</style>

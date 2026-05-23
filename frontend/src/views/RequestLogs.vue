@@ -68,6 +68,22 @@
         />
         <n-button size="small" type="primary" @click="load" :loading="loading">查询</n-button>
         <n-button size="small" @click="resetFilter">重置</n-button>
+        <n-popconfirm @positive-click="onDeleteByFilter" :show-icon="false">
+          <template #trigger>
+            <n-button size="small" type="warning" ghost :disabled="!hasAnyFilter">
+              按筛选删除
+            </n-button>
+          </template>
+          按当前筛选删除调用日志？此操作不可撤销。
+        </n-popconfirm>
+        <n-popconfirm @positive-click="onDeleteErrors" :show-icon="false">
+          <template #trigger>
+            <n-button size="small" type="error" ghost>
+              清理失败 (4xx/5xx)
+            </n-button>
+          </template>
+          确定删除所有 status_code ≥ 400 的调用日志？
+        </n-popconfirm>
       </div>
     </n-card>
 
@@ -87,9 +103,11 @@
 
 <script setup>
 import { ref, h, onMounted, reactive, computed } from 'vue'
-import { NTag, NSpace, NDescriptions, NDescriptionsItem, NCode, NDivider } from 'naive-ui'
+import { NTag, NSpace, NDescriptions, NDescriptionsItem, NCode, NDivider, NPopconfirm, useMessage } from 'naive-ui'
 import { logsApi, modelApi, upstreamApi, apiKeysApi } from '@/api'
 import dayjs from 'dayjs'
+
+const message = useMessage()
 
 const rows = ref([])
 const loading = ref(false)
@@ -132,6 +150,57 @@ function resetFilter() {
   filter.api_key_id = null
   filter.request_id = ''
   load()
+}
+
+const hasAnyFilter = computed(() =>
+  Boolean(filter.status || filter.stream || filter.model || filter.upstream_key_id ||
+          filter.api_key_id || filter.request_id ||
+          (filter.period && filter.period !== 'all'))
+)
+
+function periodToAfter(p) {
+  const now = new Date()
+  if (p === '1h') return new Date(now.getTime() - 3600_000).toISOString()
+  if (p === '24h') return new Date(now.getTime() - 86400_000).toISOString()
+  if (p === '7d') return new Date(now.getTime() - 7 * 86400_000).toISOString()
+  return null
+}
+
+async function onDeleteByFilter() {
+  const f = {}
+  // status -> status_code_gte（4xx/5xx 一律删 >= 边界）
+  if (filter.status === '4xx') f.status_code_gte = 400
+  if (filter.status === '5xx') f.status_code_gte = 500
+  if (filter.upstream_key_id) f.upstream_key_id = filter.upstream_key_id
+  if (filter.api_key_id) f.api_key_id = filter.api_key_id
+  const after = periodToAfter(filter.period)
+  if (after) f.after = after
+  // status='2xx' 没法直接表达（API 只支持 >= 阈值），提示用户
+  if (filter.status === '2xx') {
+    message.warning('当前 API 只支持按 status_code ≥ 阈值删除，2xx 暂不支持按筛选删')
+    return
+  }
+  try {
+    const { data } = await logsApi.requestBulkDelete(f)
+    if (data.error) {
+      message.warning(data.error)
+      return
+    }
+    message.success(`已删除 ${data.deleted} 条调用日志`)
+    load()
+  } catch (e) {
+    message.error(`删除失败：${e?.message || e}`)
+  }
+}
+
+async function onDeleteErrors() {
+  try {
+    const { data } = await logsApi.requestBulkDelete({ status_code_gte: 400 })
+    message.success(`已删除 ${data.deleted} 条失败请求`)
+    load()
+  } catch (e) {
+    message.error(`删除失败：${e?.message || e}`)
+  }
 }
 
 const codeType = (c) => c >= 500 ? 'error' : c >= 400 ? 'warning' : c >= 200 ? 'success' : 'default'

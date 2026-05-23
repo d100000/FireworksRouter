@@ -15,6 +15,7 @@ const routes = [
       { path: 'api-keys', component: () => import('@/views/ApiKeys.vue'), meta: { title: 'API Keys' } },
       { path: 'request-trace', component: () => import('@/views/RequestTrace.vue'), meta: { title: '调度轨迹' } },
       { path: 'request-logs', component: () => import('@/views/RequestLogs.vue'), meta: { title: '调用日志' } },
+      { path: 'system-logs', component: () => import('@/views/SystemLogs.vue'), meta: { title: '系统日志' } },
       { path: 'probe-logs', component: () => import('@/views/ProbeLogs.vue'), meta: { title: '探针历史' } },
       { path: 'settings', component: () => import('@/views/Settings.vue'), meta: { title: '系统设置' } },
     ],

@@ -106,6 +106,7 @@ import {
   DocumentTextOutline, PulseOutline, LockClosedOutline,
   LogOutOutline, SettingsOutline, MoonOutline, SunnyOutline,
   GitNetworkOutline, ShieldCheckmarkOutline, PricetagsOutline,
+  TerminalOutline,
 } from '@vicons/ionicons5'
 
 const message = useMessage()
@@ -126,6 +127,7 @@ const menuOptions = [
   { label: 'API Keys', key: '/api-keys', icon: renderIcon(LockClosedOutline) },
   { label: '调度轨迹', key: '/request-trace', icon: renderIcon(GitNetworkOutline) },
   { label: '调用日志', key: '/request-logs', icon: renderIcon(DocumentTextOutline) },
+  { label: '系统日志', key: '/system-logs', icon: renderIcon(TerminalOutline) },
   { label: '探针历史', key: '/probe-logs', icon: renderIcon(PulseOutline) },
   { label: '系统设置', key: '/settings', icon: renderIcon(SettingsOutline) },
 ]
