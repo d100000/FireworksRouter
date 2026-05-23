@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import re
 import secrets
 import sys
 from pathlib import Path
@@ -21,7 +22,21 @@ ENV_PATH = ROOT / ".env"
 ENV_EXAMPLE_PATH = ROOT / ".env.example"
 
 DEFAULT_PASSWORD = "admin1234"
-DEFAULT_PG_PASSWORD = "fwr-CHANGE-ME"
+
+
+def _replace_env_var(text: str, var_name: str, new_value: str) -> tuple[str, bool]:
+    """替换 .env 文件中某个变量的值。
+
+    匹配规则：行首（非注释）的 `VAR_NAME=任意内容`（包括空值、含特殊字符的密码），
+    用正则 + multiline 模式，兼容 LF / CRLF 行尾。
+
+    返回 (新文本, 是否替换成功)。
+    """
+    # 转义 new_value 中的反斜杠（re.sub 替换串里 \ 是特殊字符）
+    escaped_value = new_value.replace("\\", "\\\\")
+    pattern = re.compile(rf"^{re.escape(var_name)}=.*$", re.MULTILINE)
+    new_text, count = pattern.subn(f"{var_name}={escaped_value}", text, count=1)
+    return new_text, count > 0
 
 
 def main() -> None:
@@ -48,18 +63,25 @@ def main() -> None:
     pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
     password_hash = pwd_ctx.hash(password)
 
-    # 替换 .env.example 里的占位
+    # 5 个必填字段：用正则替换，兼容 .env.example 里"已有值"和"空值"两种情况
     replacements = [
-        ("ADMIN_TOKEN=", f"ADMIN_TOKEN={admin_token}"),
-        ("UPSTREAM_KEY_FERNET_KEY=", f"UPSTREAM_KEY_FERNET_KEY={fernet_key}"),
-        ("ADMIN_PASSWORD_HASH=", f"ADMIN_PASSWORD_HASH={password_hash}"),
-        ("SESSION_TOKEN_SECRET=", f"SESSION_TOKEN_SECRET={session_secret}"),
-        ("POSTGRES_PASSWORD=", f"POSTGRES_PASSWORD={pg_password}"),
+        ("ADMIN_TOKEN", admin_token),
+        ("UPSTREAM_KEY_FERNET_KEY", fernet_key),
+        ("ADMIN_PASSWORD_HASH", password_hash),
+        ("SESSION_TOKEN_SECRET", session_secret),
+        ("POSTGRES_PASSWORD", pg_password),
     ]
     out = template
-    for old, new in replacements:
-        # 只替换"等号后无内容"的行（避免重复替换/破坏注释）
-        out = out.replace(old + "\n", new + "\n", 1)
+    missing: list[str] = []
+    for var, val in replacements:
+        out, replaced = _replace_env_var(out, var, val)
+        if not replaced:
+            # .env.example 缺这个字段；追加到文末
+            out = out.rstrip("\r\n") + f"\n{var}={val}\n"
+            missing.append(var)
+
+    if missing:
+        print(f"⚠️  .env.example 中缺以下字段，已追加：{', '.join(missing)}", file=sys.stderr)
 
     ENV_PATH.write_text(out, encoding="utf-8")
 

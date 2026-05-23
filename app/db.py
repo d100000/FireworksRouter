@@ -70,7 +70,12 @@ async def get_session() -> AsyncIterator[AsyncSession]:
 
 
 async def init_db() -> None:
-    """启动时把数据库升级到最新版本（alembic upgrade head）。"""
+    """启动时把数据库升级到最新版本（alembic upgrade head）。
+
+    重要：docker compose 模式下 PG 容器的 `pg_isready` 通过后实际可能仍未完全准备好
+    接受 SQL 连接（尤其首次 initdb 跑完）。alembic 第一次连接可能 OperationalError，
+    所以加最多 30 次重试，每次间隔 2 秒。
+    """
     # 触发所有模型注册到 Base.metadata
     from app import models  # noqa: F401
 
@@ -83,10 +88,26 @@ async def init_db() -> None:
     def _upgrade() -> None:
         cfg_path = Path(__file__).resolve().parent.parent / "alembic.ini"
         if not cfg_path.exists():
-            # 兜底（如打包后没带 alembic.ini）：用 metadata.create_all
             return
         cfg = Config(str(cfg_path))
         cfg.set_main_option("sqlalchemy.url", _settings.database_url)
         command.upgrade(cfg, "head")
 
-    await asyncio.to_thread(_upgrade)
+    last_err: Exception | None = None
+    for attempt in range(30):
+        try:
+            await asyncio.to_thread(_upgrade)
+            if attempt > 0:
+                from app.utils.logger import logger
+                logger.info("alembic upgrade head 在第 {} 次重试后成功", attempt + 1)
+            return
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            from app.utils.logger import logger
+            logger.warning(
+                "alembic upgrade attempt {}/30 failed: {} — retry in 2s",
+                attempt + 1, type(e).__name__,
+            )
+            await asyncio.sleep(2)
+
+    raise RuntimeError(f"alembic upgrade 在 30 次重试后仍失败：{last_err}")

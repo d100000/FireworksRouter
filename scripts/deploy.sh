@@ -131,26 +131,34 @@ fi
 docker compose ${COMPOSE_ARGS} pull postgres redis 2>/dev/null || true
 docker compose ${COMPOSE_ARGS} up -d --build
 
+# 读 .env 里的最终 API_PORT（用户可能在 .env 里改过）
+API_PORT_HOST=$(grep '^API_PORT=' .env 2>/dev/null | cut -d= -f2 | head -1)
+API_PORT_HOST=${API_PORT_HOST:-8011}
+API_BIND_HOST=$(grep '^API_BIND=' .env 2>/dev/null | cut -d= -f2 | head -1)
+API_BIND_HOST=${API_BIND_HOST:-127.0.0.1}
+
 # ============== 5. 健康检查 ==============
-info "等待 API 启动（最多 60 秒）..."
+info "等待 API 启动（最多 90 秒，PG 初次 initdb 耗时较长）..."
 HEALTH_OK=0
-for i in $(seq 1 60); do
+for i in $(seq 1 90); do
+    # 容器内永远是 8011（Dockerfile 固定）
     if docker compose exec -T api curl -fsS http://127.0.0.1:8011/healthz >/dev/null 2>&1; then
         HEALTH_OK=1
         break
     fi
+    [ $((i % 10)) -eq 0 ] && info "  仍在等待... (${i}/90s)"
     sleep 1
 done
 if [ "$HEALTH_OK" = "0" ]; then
-    warn "API 启动超时，检查日志：docker compose logs api"
+    warn "API 启动超时，最近 50 行日志："
     docker compose logs --tail 50 api
-    exit 1
+    fail "请检查上面的错误，或运行 docker compose logs -f api 看完整日志"
 fi
 ok "API 启动成功 ✓"
 
 # ============== 6. 完成 ==============
 HOSTIP=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "127.0.0.1")
-DOMAIN_LINE=$(grep '^DOMAIN=' .env 2>/dev/null | cut -d= -f2 || echo "")
+DOMAIN_LINE=$(grep '^DOMAIN=' .env 2>/dev/null | cut -d= -f2 | head -1)
 
 echo
 echo "═══════════════════════════════════════════════════════════════"
@@ -161,9 +169,13 @@ if [ -n "$DOMAIN_LINE" ]; then
     echo "  🔒 HTTPS 访问： https://${DOMAIN_LINE}/"
     echo "  📋 首次访问前确保 ${DOMAIN_LINE} 的 A 记录指向本机 IP"
     echo "  📋 Caddy 会自动从 Let's Encrypt 申请证书（首次约 30 秒）"
+elif [ "$API_BIND_HOST" = "127.0.0.1" ]; then
+    echo "  🔒 API 只在本机监听 (127.0.0.1:${API_PORT_HOST})"
+    echo "  外网访问请通过反向代理（Caddy / Nginx）；或编辑 .env 设 API_BIND=0.0.0.0"
+    echo "  本机访问： http://127.0.0.1:${API_PORT_HOST}/"
 else
-    echo "  访问： http://${HOSTIP}:8011/   或   http://127.0.0.1:8011/"
-    echo "  ⚠️  目前是 HTTP 明文，生产建议加 HTTPS（编辑 .env 加 DOMAIN）"
+    echo "  访问： http://${HOSTIP}:${API_PORT_HOST}/   或   http://127.0.0.1:${API_PORT_HOST}/"
+    echo "  ⚠️  目前是 HTTP 明文，生产建议加 HTTPS（编辑 .env 加 DOMAIN= 后重跑此脚本）"
 fi
 echo
 echo "  下一步推荐："
