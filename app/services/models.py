@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from loguru import logger
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -75,6 +76,7 @@ async def sync_from_fireworks(session: AsyncSession, api_key: str) -> dict[str, 
     - 返回：total / created / updated / priced（命中价格表的总数）/ unpriced（无价格需手填）
     """
     items = await fw.list_models(api_key)
+    logger.info("model sync: fetched {} models from Fireworks", len(items))
     created = 0
     updated = 0
     priced = 0
@@ -132,6 +134,7 @@ async def sync_from_fireworks(session: AsyncSession, api_key: str) -> dict[str, 
                 priced += 1
             else:
                 unpriced += 1
+            logger.debug("model sync: created {} (priced={})", path, has_known_entry)
         else:
             existing.category = category
             existing.context_length = context_length or existing.context_length
@@ -154,11 +157,17 @@ async def sync_from_fireworks(session: AsyncSession, api_key: str) -> dict[str, 
                 priced += 1
             else:
                 unpriced += 1
+            logger.debug("model sync: updated {}", path)
 
-    return {
+    summary = {
         "total": len(items),
         "created": created,
         "updated": updated,
         "priced": priced,
         "unpriced": unpriced,
     }
+    logger.info(
+        "model sync done: total={total} created={created} updated={updated} priced={priced} unpriced={unpriced}",
+        **summary,
+    )
+    return summary

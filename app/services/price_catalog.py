@@ -47,11 +47,13 @@ async def lookup_price(session: AsyncSession, model_path_or_name: str) -> PriceL
         return PriceLookupResult(None)
     name = model_path_or_name.rsplit("/", 1)[-1].lower()
 
+    # enabled 是 Integer 列（见 ModelPriceCatalog.enabled 定义），不是 Boolean，
+    # 所以用 `.is_(True)` 在某些方言会绕路或匹配不到行 — 用 `== 1` 显式匹配整数值。
     rows = list(
         (
             await session.execute(
                 select(ModelPriceCatalog)
-                .where(ModelPriceCatalog.enabled.is_(True))
+                .where(ModelPriceCatalog.enabled == 1)
                 .order_by(ModelPriceCatalog.priority.desc(), ModelPriceCatalog.id.desc())
             )
         ).scalars().all()
@@ -87,6 +89,8 @@ async def seed_initial(session: AsyncSession) -> int:
     """
     inserted = 0
     for pattern, price in KNOWN_PRICES.items():
+        # `.scalar_one_or_none()` 严格模式：碰到重复 seed 条目（如旧版本残留 + 新种子）
+        # 会抛 MultipleResultsFound，让整个 seed 失败。用 `.first()` 允许跳过即可。
         existing = (
             await session.execute(
                 select(ModelPriceCatalog).where(
@@ -94,7 +98,7 @@ async def seed_initial(session: AsyncSession) -> int:
                     ModelPriceCatalog.source == PriceSource.seed,
                 )
             )
-        ).scalar_one_or_none()
+        ).scalars().first()
         if existing is not None:
             continue
         # 判定单位
