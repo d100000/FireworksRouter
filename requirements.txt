@@ -15,7 +15,8 @@ python-multipart==0.0.20
 click==8.1.8
 # 注：不需要 psycopg / psycopg2，因为我们用 asyncpg（异步驱动）；
 # alembic env.py 也是 async_engine_from_config，从头到尾不需要 sync 驱动
-passlib[bcrypt]==1.7.4
 bcrypt==4.2.1
+# 不再依赖 passlib（与新版 bcrypt 不兼容）— 直接用 bcrypt 库 hash/verify
+# scripts/bootstrap.py + app/services/session.py 都已迁移
 python-jose[cryptography]==3.3.0
 email-validator==2.2.0

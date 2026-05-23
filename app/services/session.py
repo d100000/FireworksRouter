@@ -1,6 +1,12 @@
 """管理端单密码登录：bcrypt 校验 + 短期 session JWT。
 
 不再涉及多用户系统，只有"通过管理密码 → 拿到 session token"这一条路。
+
+直接用 bcrypt 库（不走 passlib）：
+- passlib 1.7.4 仍读 bcrypt.__about__.__version__，bcrypt 4.1+ 移除了该属性
+  会触发"error reading bcrypt version" 警告，某些环境下直接 ImportError
+- 直接用 bcrypt 库更稳，且输出哈希与 passlib 完全兼容（同为 $2b$ 标准格式）
+- 主动做 72 字节上限校验（bcrypt 协议硬限），避免新版库静默截断造成的混淆
 """
 
 from __future__ import annotations
@@ -8,27 +14,40 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import bcrypt
 from jose import JWTError, jwt
-from passlib.context import CryptContext
 
 from app.config import get_settings
 
 settings = get_settings()
 
-_pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
 SESSION_KIND = "admin_session"
 DB_SETTING_KEY = "admin.password_hash"
+BCRYPT_MAX_BYTES = 72
 
 
 def hash_password(password: str) -> str:
-    return _pwd.hash(password)
+    """生成 bcrypt 哈希（cost factor 12）。"""
+    pw_bytes = password.encode("utf-8")
+    if len(pw_bytes) > BCRYPT_MAX_BYTES:
+        raise ValueError(
+            f"密码字节长度 {len(pw_bytes)} 超出 bcrypt 上限 {BCRYPT_MAX_BYTES}（中文 ≈ 3 字节）"
+        )
+    return bcrypt.hashpw(pw_bytes, bcrypt.gensalt(rounds=12)).decode("utf-8")
 
 
 def verify_password(password: str, hashed: str) -> bool:
+    """校验密码。无效 / 超长 / 哈希格式错都返回 False（不抛异常）。"""
+    if not password or not hashed:
+        return False
     try:
-        return _pwd.verify(password, hashed)
-    except Exception:  # noqa: BLE001
+        pw_bytes = password.encode("utf-8")
+        # 超过 72 字节直接拒绝（不要静默截断 — 那样会让两个不同密码哈希成同一个）
+        if len(pw_bytes) > BCRYPT_MAX_BYTES:
+            return False
+        return bcrypt.checkpw(pw_bytes, hashed.encode("utf-8"))
+    except (ValueError, TypeError):
+        # hashed 格式不对（如不是 $2b$ 开头）
         return False
 
 
