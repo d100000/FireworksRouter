@@ -41,6 +41,9 @@ export const modelApi = {
   delete: (id) => api.delete(`/admin/models/${id}`),
   sync: () => api.post('/admin/models/sync'),
   batchStatus: (ids, status) => api.post('/admin/models/batch-status', { ids, status }),
+  exportJson: () => api.get('/admin/models/export-json'),
+  importJson: (data, strategy = 'skip') =>
+    api.post('/admin/models/import-json', { data, strategy }),
 }
 
 export const priceCatalogApi = {

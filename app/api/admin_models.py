@@ -257,3 +257,181 @@ async def sync_models(session: SessionDep) -> dict[str, Any]:
             "details": {"tried_keys": len(candidates), "last_error": str(last_err)[:200]},
         }},
     )
+
+
+# ============================ JSON 导入 / 导出 ============================
+
+
+@router.get("/models/export-json")
+async def export_models_json(session: SessionDep) -> dict[str, Any]:
+    """导出所有模型为 JSON 数组（原生格式，可直接 import 回来）。
+
+    适用：备份、迁移到另一个环境、批量编辑后再导入。
+    """
+    rows = list((await session.execute(
+        select(Model).order_by(Model.sort_order, Model.id)
+    )).scalars().all())
+    return {
+        "count": len(rows),
+        "items": [
+            {
+                "public_name": m.public_name,
+                "fireworks_path": m.fireworks_path,
+                "category": m.category.value,
+                "status": m.status.value,
+                "context_length": m.context_length,
+                "max_output_tokens": m.max_output_tokens,
+                "input_price_per_1m": m.input_price_per_1m,
+                "output_price_per_1m": m.output_price_per_1m,
+                "cached_input_price_per_1m": m.cached_input_price_per_1m,
+                "supports_streaming": m.supports_streaming,
+                "supports_tools": m.supports_tools,
+                "supports_vision": m.supports_vision,
+                "supports_reasoning": m.supports_reasoning,
+                "sort_order": m.sort_order,
+                "description": m.description,
+            }
+            for m in rows
+        ],
+    }
+
+
+class ImportModelsIn(BaseModel):
+    data: Any                            # list 或 {items: [...]}
+    strategy: str = "skip"               # skip / update / replace
+
+
+def _normalize_model_item(item: dict) -> dict:
+    """模型条目预处理 + 校验。返回标准化字段，不合规抛 ValueError。"""
+    public_name = (item.get("public_name") or "").strip()
+    if not public_name:
+        raise ValueError("missing 'public_name'")
+    fireworks_path = (item.get("fireworks_path") or "").strip()
+    if not fireworks_path:
+        # fallback：把 public_name 当 fireworks_path
+        fireworks_path = f"accounts/fireworks/models/{public_name}"
+
+    # category 校验
+    cat_str = (item.get("category") or "chat").lower()
+    try:
+        category = ModelCategory(cat_str)
+    except ValueError:
+        raise ValueError(f"invalid category: {cat_str}") from None
+
+    # status 校验
+    status_str = (item.get("status") or "active").lower()
+    try:
+        model_status = ModelStatus(status_str)
+    except ValueError:
+        raise ValueError(f"invalid status: {status_str}") from None
+
+    return {
+        "public_name": public_name,
+        "fireworks_path": fireworks_path,
+        "category": category,
+        "status": model_status,
+        "context_length": int(item.get("context_length") or 0),
+        "max_output_tokens": int(item.get("max_output_tokens") or 0),
+        "input_price_per_1m": float(item.get("input_price_per_1m") or 0),
+        "output_price_per_1m": float(item.get("output_price_per_1m") or 0),
+        "cached_input_price_per_1m": float(item.get("cached_input_price_per_1m") or 0),
+        "supports_streaming": bool(item.get("supports_streaming", True)),
+        "supports_tools": bool(item.get("supports_tools", False)),
+        "supports_vision": bool(item.get("supports_vision", False)),
+        "supports_reasoning": bool(item.get("supports_reasoning", False)),
+        "sort_order": int(item.get("sort_order") or 0),
+        "description": item.get("description") or None,
+    }
+
+
+@router.post("/models/import-json")
+async def import_models_json(payload: ImportModelsIn, session: SessionDep) -> dict[str, Any]:
+    """从 JSON 批量导入模型。
+
+    支持的 JSON 格式：
+
+    **格式 1 — 原生数组**（推荐，与 export-json 出来的形态对称）：
+    ```
+    [
+      {
+        "public_name": "gpt-oss-120b",
+        "fireworks_path": "accounts/fireworks/models/gpt-oss-120b",
+        "category": "chat",
+        "status": "active",
+        "context_length": 131072,
+        "input_price_per_1m": 0.15,
+        "output_price_per_1m": 0.60,
+        "supports_streaming": true,
+        "supports_tools": true,
+        "description": "GPT-OSS 120B"
+      }
+    ]
+    ```
+
+    **格式 2 — 包装对象**：`{items: [...]}`（与 export-json 输出兼容）
+
+    **strategy 合并策略**：
+    - `skip`（默认）：public_name 已存在 → 跳过；最安全
+    - `update`：public_name 已存在 → 用新数据覆盖
+    - `replace`：先清空 models 表，再全量插入（⚠️ 慎用，会丢失手填的价格）
+    """
+    if payload.strategy not in ("skip", "update", "replace"):
+        raise HTTPException(status_code=400, detail=f"invalid strategy: {payload.strategy}")
+
+    # 解析格式
+    raw_items: list[Any] = []
+    if isinstance(payload.data, list):
+        raw_items = payload.data
+    elif isinstance(payload.data, dict) and isinstance(payload.data.get("items"), list):
+        raw_items = payload.data["items"]
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Unrecognized JSON format. Expected array or {items: [...]}",
+        )
+
+    # 校验每条
+    errors: list[str] = []
+    normalized: list[dict] = []
+    for idx, raw in enumerate(raw_items):
+        try:
+            if not isinstance(raw, dict):
+                raise ValueError(f"item must be object, got {type(raw).__name__}")
+            normalized.append(_normalize_model_item(raw))
+        except (ValueError, TypeError) as e:
+            errors.append(f"item[{idx}]: {e}")
+
+    received = len(normalized)
+
+    # replace 模式先清空
+    if payload.strategy == "replace":
+        existing = list((await session.execute(select(Model))).scalars().all())
+        for r in existing:
+            await session.delete(r)
+        await session.flush()
+
+    created = 0
+    updated = 0
+    skipped = 0
+    for item in normalized:
+        existing = (await session.execute(
+            select(Model).where(Model.public_name == item["public_name"])
+        )).scalar_one_or_none()
+
+        if existing is None or payload.strategy == "replace":
+            session.add(Model(**item))
+            created += 1
+        elif payload.strategy == "update":
+            for field, value in item.items():
+                setattr(existing, field, value)
+            updated += 1
+        else:  # skip
+            skipped += 1
+
+    return {
+        "received": received,
+        "created": created,
+        "updated": updated,
+        "skipped": skipped,
+        "errors": errors,
+    }
