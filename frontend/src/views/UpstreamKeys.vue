@@ -4,10 +4,16 @@
       <n-space>
         <n-button type="primary" @click="openAdd">添加 Key</n-button>
         <n-button @click="openBatch">批量导入</n-button>
-        <n-button @click="probeAll" :loading="probing">全量探针</n-button>
-        <n-button @click="load">刷新</n-button>
+        <n-button type="primary" ghost @click="refreshAllBalances" :loading="refreshingAll">
+          <template #icon><n-icon><WalletOutline /></n-icon></template>
+          更新所有余额
+        </n-button>
+        <n-button @click="probeAll" :loading="probing">全量探针（含状态决策）</n-button>
+        <n-button @click="load">刷新列表</n-button>
       </n-space>
-      <n-text depth="3">共 {{ rows.length }} 个 · 冷却中 {{ inCooldownCount }} 个</n-text>
+      <n-text depth="3">
+        共 {{ rows.length }} 个 · 冷却中 {{ inCooldownCount }} 个 · 总余额 ${{ totalBalance.toFixed(2) }}
+      </n-text>
     </n-space>
 
     <n-data-table :columns="columns" :data="rows" :loading="loading" size="small" :scroll-x="1900" />
@@ -134,7 +140,8 @@ import { CanvasRenderer } from 'echarts/renderers'
 import { LineChart, PieChart } from 'echarts/charts'
 import { GridComponent, TooltipComponent, LegendComponent } from 'echarts/components'
 import VChart from 'vue-echarts'
-import { NTag, NButton, NPopconfirm, NSpace, useMessage } from 'naive-ui'
+import { NTag, NButton, NIcon, NPopconfirm, NSpace, useMessage } from 'naive-ui'
+import { WalletOutline } from '@vicons/ionicons5'
 import { upstreamApi } from '@/api'
 import { useThemeStore } from '@/stores/theme'
 import StatusDot from '@/components/StatusDot.vue'
@@ -165,6 +172,22 @@ const errorBreakdown = ref([])
 const modelStates = ref([])
 
 const inCooldownCount = computed(() => rows.value.filter(r => r.cooldown_until && new Date(r.cooldown_until) > new Date()).length)
+const totalBalance = computed(() => rows.value.filter(r => r.enabled).reduce((sum, r) => sum + (r.balance_usd || 0), 0))
+const refreshingAll = ref(false)
+const refreshingIds = ref(new Set())
+
+function relativeTime(iso) {
+  const t = new Date(iso).getTime()
+  const diff = Date.now() - t
+  if (diff < 0) return '未来'
+  const s = Math.floor(diff / 1000)
+  if (s < 60) return `${s} 秒前`
+  const m = Math.floor(s / 60)
+  if (m < 60) return `${m} 分钟前`
+  const h = Math.floor(m / 60)
+  if (h < 24) return `${h} 小时前`
+  return `${Math.floor(h / 24)} 天前`
+}
 
 const scoreType = (s) => s >= 0.95 ? 'success' : s >= 0.8 ? 'info' : s >= 0.5 ? 'warning' : 'error'
 const scoreColor = (s) => s >= 0.95 ? '#22c55e' : s >= 0.8 ? '#3b82f6' : s >= 0.5 ? '#f59e0b' : '#ef4444'
@@ -193,13 +216,21 @@ const columns = [
     }),
   },
   {
-    title: '余额 / 上限', key: 'balance_usd', width: 170,
-    render: (r) => h(BalanceBar, {
-      balance: r.balance_usd ?? 0,
-      limit: r.monthly_spend_limit_usd ?? 0,
-      used: r.monthly_spend_used_usd ?? 0,
-      pct: r.balance_percent ?? 0,
-    }),
+    title: '余额 / 上限', key: 'balance_usd', width: 180,
+    render: (r) => h('div', null, [
+      h(BalanceBar, {
+        balance: r.balance_usd ?? 0,
+        limit: r.monthly_spend_limit_usd ?? 0,
+        used: r.monthly_spend_used_usd ?? 0,
+        pct: r.balance_percent ?? 0,
+      }),
+      r.balance_updated_at
+        ? h('div', {
+            style: 'font-size:10px;color:var(--n-text-color-3,#94a3b8);margin-top:2px',
+            title: new Date(r.balance_updated_at).toLocaleString(),
+          }, `更新于 ${relativeTime(r.balance_updated_at)}`)
+        : null,
+    ]),
   },
   {
     title: '冷却', key: 'cooldown_until', width: 130,
@@ -213,9 +244,14 @@ const columns = [
     render: (r) => r.last_success_at ? new Date(r.last_success_at).toLocaleString() : '-',
   },
   {
-    title: '操作', key: 'actions', fixed: 'right', width: 290,
+    title: '操作', key: 'actions', fixed: 'right', width: 360,
     render: (row) => h(NSpace, { size: 'small' }, () => [
       h(NButton, { size: 'tiny', type: 'primary', onClick: () => openDetail(row) }, () => '详情'),
+      h(NButton, {
+        size: 'tiny', type: 'primary', ghost: true,
+        loading: refreshingIds.value.has(row.id),
+        onClick: () => refreshBalance(row.id),
+      }, () => '更新余额'),
       h(NButton, { size: 'tiny', onClick: () => probeOne(row.id) }, () => '探针'),
       h(NButton, {
         size: 'tiny', type: row.enabled ? 'warning' : 'primary',
@@ -314,6 +350,53 @@ async function probeOne(id) {
   } catch (e) {
     message.error('探针失败')
   }
+}
+
+async function refreshBalance(id) {
+  refreshingIds.value.add(id)
+  try {
+    const { data } = await upstreamApi.refreshBalance(id)
+    if (data.ok) {
+      const delta = data.delta_balance_usd || 0
+      const arrow = delta > 0 ? '↑' : delta < 0 ? '↓' : '·'
+      const sign = delta > 0 ? '+' : ''
+      const deltaStr = Math.abs(delta) < 0.001 ? '无变化' : `${arrow} ${sign}$${delta.toFixed(4)}`
+      message.success(
+        `${data.key_preview}: $${data.balance_usd.toFixed(4)} / $${data.monthly_spend_limit_usd.toFixed(0)} (${data.balance_percent.toFixed(1)}%) ${deltaStr} · ${data.latency_ms}ms`,
+        { duration: 6000 },
+      )
+    } else {
+      message.error(`${data.key_preview} 余额查询失败: ${data.error}`, { duration: 8000 })
+    }
+    await load()
+  } catch (e) {
+    message.error('余额查询失败: ' + (e?.response?.data?.detail || e.message))
+  } finally {
+    refreshingIds.value.delete(id)
+    refreshingIds.value = new Set(refreshingIds.value)
+  }
+}
+
+async function refreshAllBalances() {
+  refreshingAll.value = true
+  try {
+    const { data } = await upstreamApi.refreshBalancesAll()
+    const failedDetail = data.items.filter(i => !i.ok)
+    if (failedDetail.length === 0) {
+      message.success(
+        `🎉 ${data.ok}/${data.total} 把 Key 余额已更新，总余额 $${data.total_balance_usd.toFixed(2)} · ${data.ms}ms`,
+        { duration: 6000 },
+      )
+    } else {
+      message.warning(
+        `成功 ${data.ok} / 失败 ${data.fail} / 总余额 $${data.total_balance_usd.toFixed(2)}，失败 Key: ${failedDetail.slice(0, 3).map(i => i.key_preview).join(', ')}`,
+        { duration: 8000 },
+      )
+    }
+    await load()
+  } catch (e) {
+    message.error('批量更新失败: ' + (e?.response?.data?.detail || e.message))
+  } finally { refreshingAll.value = false }
 }
 
 async function toggleEnabled(row) {

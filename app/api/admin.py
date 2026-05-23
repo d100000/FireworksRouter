@@ -283,6 +283,44 @@ async def trigger_probe_round() -> dict[str, int]:
     return await balance_svc.run_probe_round()
 
 
+@router.post("/upstream-keys/{key_id}/refresh-balance")
+async def refresh_balance_one(key_id: int) -> dict[str, Any]:
+    """轻量级手动刷新单把 Key 的余额。
+
+    与 /probe 的区别：
+    - 不会因为余额低 / suspendState 而把 Key 标记为 auto_disabled
+    - 不写 ProbeHistory（不污染探针日志）
+    - 返回新旧余额对比 + 占用率，方便 UI 直观展示
+    """
+    result = await balance_svc.refresh_balance_one(key_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="not found")
+    return {
+        "key_id": result.key_id,
+        "key_preview": result.key_preview,
+        "ok": result.ok,
+        "previous_balance_usd": result.previous_balance_usd,
+        "previous_used_usd": result.previous_used_usd,
+        "balance_usd": result.balance_usd,
+        "monthly_spend_limit_usd": result.monthly_spend_limit_usd,
+        "monthly_spend_used_usd": result.monthly_spend_used_usd,
+        "balance_percent": result.balance_percent,
+        "used_percent": result.used_percent,
+        "delta_balance_usd": result.delta_balance_usd,
+        "delta_used_usd": result.delta_used_usd,
+        "suspend_state": result.suspend_state,
+        "account_state": result.account_state,
+        "error": result.error,
+        "latency_ms": result.latency_ms,
+    }
+
+
+@router.post("/upstream-keys/refresh-balances")
+async def refresh_balances_all() -> dict[str, Any]:
+    """批量并发刷新所有可调度 Key 的余额（10 并发）。"""
+    return await balance_svc.refresh_balance_all()
+
+
 # ============================= API Keys (下游 sk-fwr-) =============================
 
 
