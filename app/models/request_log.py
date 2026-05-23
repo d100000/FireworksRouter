@@ -24,6 +24,15 @@ class RequestLog(Base):
         Index("ix_request_logs_api_key", "api_key_id"),
         Index("ix_request_logs_upstream", "upstream_key_id"),
         Index("ix_request_logs_request_id", "request_id"),
+        # 复合索引覆盖热门查询路径：
+        # 1) 按 api_key 拉最近 N 条 — me/admin tokens 日志
+        Index("ix_request_logs_api_key_created", "api_key_id", "created_at"),
+        # 2) 按 upstream 拉最近 N 条 — UpstreamKey 详情抽屉的 recent_requests
+        Index("ix_request_logs_upstream_id_desc", "upstream_key_id", "id"),
+        # 3) 按 model + 时间 — stats_top / 日志筛选含模型时
+        Index("ix_request_logs_model_created", "public_model", "created_at"),
+        # 4) 状态码 — error breakdown / 日志按状态筛
+        Index("ix_request_logs_status", "status_code"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)

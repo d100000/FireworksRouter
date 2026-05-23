@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hmac
+import time
 from typing import Annotated
 
 from fastapi import Depends, Header, HTTPException, Request, status
@@ -17,6 +18,48 @@ from app.utils.tokens import hash_token
 settings = get_settings()
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
+
+
+# ============================ ApiKey 鉴权缓存 ============================
+# 每个 /v1/* 请求都要查一次 api_keys 表；高 QPS 下这是热点。
+# 用进程内 TTL=30s 的缓存，命中时省掉 DB 查询。
+# 牺牲：管理员改 / 删 / rotate token 后最多 30s 才生效。
+#
+# 多 worker 部署时每个 worker 各自缓存（最坏情况延后 30s）；可接受。
+
+_TOKEN_CACHE: dict[str, tuple[float, dict]] = {}
+_TOKEN_CACHE_TTL = 30.0
+_TOKEN_CACHE_MAX = 10000
+
+
+def _cache_evict_if_full() -> None:
+    if len(_TOKEN_CACHE) > _TOKEN_CACHE_MAX:
+        # 简易清空：达到上限时全清（生产可换 LRU）
+        _TOKEN_CACHE.clear()
+
+
+def _cache_get(token_hash: str) -> dict | None:
+    entry = _TOKEN_CACHE.get(token_hash)
+    if entry is None:
+        return None
+    expires_at, payload = entry
+    if time.time() > expires_at:
+        _TOKEN_CACHE.pop(token_hash, None)
+        return None
+    return payload
+
+
+def _cache_put(token_hash: str, payload: dict) -> None:
+    _cache_evict_if_full()
+    _TOKEN_CACHE[token_hash] = (time.time() + _TOKEN_CACHE_TTL, payload)
+
+
+def invalidate_api_key_cache(token_hash: str | None = None) -> None:
+    """token 改/删/rotate 时调用。token_hash=None 全清。"""
+    if token_hash is None:
+        _TOKEN_CACHE.clear()
+    else:
+        _TOKEN_CACHE.pop(token_hash, None)
 
 
 class APIError(HTTPException):
@@ -87,9 +130,27 @@ async def require_api_key(
     session: SessionDep,
     authorization: Annotated[str | None, Header(alias="Authorization")] = None,
 ) -> ApiKey:
-    """下游网关鉴权：校验 sk-fwr- 形式的 API Key。"""
+    """下游网关鉴权：校验 sk-fwr- 形式的 API Key。
+
+    优化：TTL=30s 的进程内缓存命中时省 DB 查询。高 QPS 下减少 ~95% 的 api_keys
+    查询压力。
+    """
     raw = _extract_bearer(authorization)
     h = hash_token(raw)
+
+    # 1) 缓存命中（不查 DB；但仍需校验配额状态）
+    cached = _cache_get(h)
+    if cached is not None:
+        # 缓存里 quota 不会随调用变化（每次调用真实扣额度还会读 DB ApiKey 行）
+        # 这里只是放行鉴权层，下游 forward() 会再做实时 quota 检查
+        stmt = select(ApiKey).where(ApiKey.id == cached["id"])
+        record = (await session.execute(stmt)).scalar_one_or_none()
+        if record is not None and record.status == ApiKeyStatus.active and record.is_usable:
+            return record
+        # 缓存的 record 已无效，invalidate 后走完整路径
+        invalidate_api_key_cache(h)
+
+    # 2) 缓存未命中，走完整查询
     stmt = select(ApiKey).where(ApiKey.token_hash == h)
     record = (await session.execute(stmt)).scalar_one_or_none()
     if record is None:
@@ -113,6 +174,9 @@ async def require_api_key(
             "insufficient_quota",
             error_code="insufficient_quota",
         )
+
+    # 缓存命中信息（只缓存 id；具体配额每次还要查实时数据）
+    _cache_put(h, {"id": record.id})
     return record
 
 

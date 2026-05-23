@@ -445,6 +445,8 @@ async def delete_api_key(key_id: int, session: SessionDep):
     record = await session.get(ApiKey, key_id)
     if record is None:
         raise HTTPException(status_code=404, detail="not found")
+    from app.api.deps import invalidate_api_key_cache
+    invalidate_api_key_cache(record.token_hash)
     await session.delete(record)
 
 
@@ -453,6 +455,8 @@ async def rotate_api_key(key_id: int, session: SessionDep):
     record = await session.get(ApiKey, key_id)
     if record is None:
         raise HTTPException(status_code=404, detail="not found")
+    from app.api.deps import invalidate_api_key_cache
+    invalidate_api_key_cache(record.token_hash)
     new_token = generate_user_token()
     record.token_hash = hash_token(new_token)
     record.token_preview = f"{new_token[:10]}...{new_token[-4:]}"
@@ -578,42 +582,64 @@ async def list_probe_logs(
 
 @router.get("/stats/overview")
 async def stats_overview(session: SessionDep) -> dict[str, Any]:
-    upstream_total = await session.scalar(select(func.count(UpstreamKey.id)))
-    upstream_active = await session.scalar(
-        select(func.count(UpstreamKey.id)).where(
-            UpstreamKey.status == UpstreamKeyStatus.active, UpstreamKey.enabled.is_(True)
+    """Dashboard 5 秒一刷，优化前是 8 次独立 COUNT/SUM；现在合并为 3 次。
+
+    upstream_keys 表行数小（< 1000），一次扫即可用 CASE WHEN 出所有桶。
+    request_logs 行数大，全表 COUNT 慢，改为只数最近 24h 的（实用且快）。
+    """
+    from sqlalchemy import case
+
+    now = datetime.now(timezone.utc)
+    # 1) upstream_keys 一次 SQL 出 6 个聚合（CASE WHEN）
+    upstream_row = (await session.execute(
+        select(
+            func.count(UpstreamKey.id).label("total"),
+            func.sum(
+                case((
+                    (UpstreamKey.status == UpstreamKeyStatus.active) & UpstreamKey.enabled.is_(True),
+                    1,
+                ), else_=0)
+            ).label("active"),
+            func.sum(
+                case((UpstreamKey.status == UpstreamKeyStatus.auto_disabled, 1), else_=0)
+            ).label("auto_disabled"),
+            func.sum(
+                case((
+                    (UpstreamKey.cooldown_until.isnot(None)) & (UpstreamKey.cooldown_until > now),
+                    1,
+                ), else_=0)
+            ).label("in_cooldown"),
+            func.coalesce(func.sum(
+                case((
+                    (UpstreamKey.status == UpstreamKeyStatus.active) & UpstreamKey.enabled.is_(True),
+                    UpstreamKey.balance_usd,
+                ), else_=0)
+            ), 0.0).label("total_balance"),
+            func.coalesce(func.sum(UpstreamKey.monthly_spend_used_usd), 0.0).label("total_used"),
         )
-    )
-    upstream_auto_disabled = await session.scalar(
-        select(func.count(UpstreamKey.id)).where(UpstreamKey.status == UpstreamKeyStatus.auto_disabled)
-    )
-    upstream_in_cooldown = await session.scalar(
-        select(func.count(UpstreamKey.id)).where(
-            UpstreamKey.cooldown_until.isnot(None),
-            UpstreamKey.cooldown_until > datetime.now(timezone.utc),
-        )
-    )
-    total_balance = await session.scalar(
-        select(func.coalesce(func.sum(UpstreamKey.balance_usd), 0.0)).where(
-            UpstreamKey.status == UpstreamKeyStatus.active, UpstreamKey.enabled.is_(True)
-        )
-    )
-    total_used = await session.scalar(
-        select(func.coalesce(func.sum(UpstreamKey.monthly_spend_used_usd), 0.0))
-    )
+    )).first()
+
+    # 2) api_keys 总数 — 1 次 SQL
     api_keys_total = await session.scalar(select(func.count(ApiKey.id)))
-    requests_total = await session.scalar(select(func.count(RequestLog.id)))
+
+    # 3) request_logs 最近 24h 计数（避免全表扫，老日志被 cleaner 清掉后 COUNT 也快）
+    requests_total = await session.scalar(
+        select(func.count(RequestLog.id)).where(
+            RequestLog.created_at >= now - timedelta(hours=24)
+        )
+    )
+
     return {
         "upstream": {
-            "total": int(upstream_total or 0),
-            "active": int(upstream_active or 0),
-            "auto_disabled": int(upstream_auto_disabled or 0),
-            "in_cooldown": int(upstream_in_cooldown or 0),
-            "total_balance_usd": float(total_balance or 0.0),
-            "total_used_usd": float(total_used or 0.0),
+            "total": int(upstream_row.total or 0),
+            "active": int(upstream_row.active or 0),
+            "auto_disabled": int(upstream_row.auto_disabled or 0),
+            "in_cooldown": int(upstream_row.in_cooldown or 0),
+            "total_balance_usd": float(upstream_row.total_balance or 0.0),
+            "total_used_usd": float(upstream_row.total_used or 0.0),
         },
         "api_keys_total": int(api_keys_total or 0),
-        "requests_total": int(requests_total or 0),
+        "requests_total_24h": int(requests_total or 0),
     }
 
 
@@ -815,35 +841,54 @@ async def stats_timeseries(
     period_hours: int = Query(24, ge=1, le=24 * 7),
     bucket: Literal["hour", "minute"] = "hour",
 ) -> dict[str, Any]:
+    """SQL GROUP BY 直接出桶（替代旧版的"拉全量再 Python 分桶"）。
+
+    数据量大时，1 周百万行的全量 SELECT 改为 SQL 内 strftime/DATE_TRUNC 聚合，
+    返回到 Python 层只有 N 桶（24h*60=1440 个 minute 桶，或 24-168 个 hour 桶）。
+    传输量减少 1000+ 倍，DB 也只做一次顺序扫 + 哈希聚合。
+    """
+    from app.db import _settings as _db_settings  # is_sqlite
+
     since = datetime.now(timezone.utc) - timedelta(hours=period_hours)
-    stmt = select(
-        RequestLog.created_at,
-        RequestLog.prompt_tokens,
-        RequestLog.completion_tokens,
-        RequestLog.billed_cost_usd,
-        RequestLog.status_code,
-    ).where(RequestLog.created_at >= since)
-    rows = list((await session.execute(stmt)).all())
-
-    buckets: dict[str, dict[str, float]] = {}
-
-    def _ts_to_bucket(t: datetime) -> str:
-        if t.tzinfo is None:
-            t = t.replace(tzinfo=timezone.utc)
+    # 兼容 SQLite (strftime) 和 PostgreSQL (date_trunc) 的桶化表达式
+    if _db_settings.is_sqlite:
         if bucket == "minute":
-            t = t.replace(second=0, microsecond=0)
+            bucket_col = func.strftime("%Y-%m-%dT%H:%M:00", RequestLog.created_at)
         else:
-            t = t.replace(minute=0, second=0, microsecond=0)
-        return t.isoformat()
+            bucket_col = func.strftime("%Y-%m-%dT%H:00:00", RequestLog.created_at)
+    else:
+        # PostgreSQL
+        bucket_col = func.date_trunc(bucket, RequestLog.created_at)
 
-    for r in rows:
-        key = _ts_to_bucket(r.created_at)
-        b = buckets.setdefault(key, {"requests": 0, "tokens": 0, "cost_usd": 0.0, "errors": 0})
-        b["requests"] += 1
-        b["tokens"] += int((r.prompt_tokens or 0) + (r.completion_tokens or 0))
-        b["cost_usd"] += float(r.billed_cost_usd or 0.0)
-        if (r.status_code or 0) >= 400:
-            b["errors"] += 1
-
-    series = sorted([{"ts": k, **v} for k, v in buckets.items()], key=lambda x: x["ts"])
+    stmt = (
+        select(
+            bucket_col.label("ts"),
+            func.count(RequestLog.id).label("requests"),
+            func.coalesce(
+                func.sum(RequestLog.prompt_tokens + RequestLog.completion_tokens), 0
+            ).label("tokens"),
+            func.coalesce(func.sum(RequestLog.billed_cost_usd), 0.0).label("cost_usd"),
+            func.sum(
+                # 错误 = status_code >= 400
+                # SQLite 不支持 case 表达式里的 boolean 算术，必须用 case
+                func.coalesce(
+                    func.cast(RequestLog.status_code >= 400, type_=RequestLog.id.type), 0
+                )
+            ).label("errors"),
+        )
+        .where(RequestLog.created_at >= since)
+        .group_by(bucket_col)
+        .order_by(bucket_col)
+    )
+    rows = list((await session.execute(stmt)).all())
+    series = [
+        {
+            "ts": (r.ts if isinstance(r.ts, str) else r.ts.isoformat()),
+            "requests": int(r.requests or 0),
+            "tokens": int(r.tokens or 0),
+            "cost_usd": float(r.cost_usd or 0.0),
+            "errors": int(r.errors or 0),
+        }
+        for r in rows
+    ]
     return {"period_hours": period_hours, "bucket": bucket, "series": series}
