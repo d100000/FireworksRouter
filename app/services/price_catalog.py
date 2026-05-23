@@ -132,6 +132,212 @@ LITELLM_PRICES_URL = (
 )
 
 
+# ============================= JSON 导入 / 导出 =============================
+
+
+@dataclass
+class ImportResult:
+    received: int            # 收到几条
+    created: int             # 新建
+    updated: int             # 覆盖更新
+    skipped: int             # 跳过（已存在）
+    errors: list[str]        # 失败原因
+
+
+def _is_litellm_format(data) -> bool:
+    """检测 JSON 是否是 LiteLLM 格式（{key: {input_cost_per_token, ...}}）。"""
+    if not isinstance(data, dict):
+        return False
+    if not data:
+        return False
+    # 取第一个 value，是 dict 且含 input_cost_per_token / litellm_provider 任一字段
+    first = next(iter(data.values()))
+    if not isinstance(first, dict):
+        return False
+    return any(k in first for k in ("input_cost_per_token", "output_cost_per_token", "litellm_provider"))
+
+
+def _normalize_native_item(item: dict) -> dict:
+    """原生格式条目预处理 + 校验。返回标准化字段或抛 ValueError。"""
+    pattern = (item.get("pattern") or "").strip().lower()
+    if not pattern:
+        raise ValueError("missing 'pattern'")
+    match_type = (item.get("match_type") or "contains").lower()
+    if match_type not in ("exact", "contains", "prefix"):
+        raise ValueError(f"invalid match_type: {match_type}")
+    unit = (item.get("unit") or "per_token").lower()
+    if unit not in ("per_token", "per_image", "per_step", "per_request"):
+        raise ValueError(f"invalid unit: {unit}")
+    return {
+        "pattern": pattern,
+        "match_type": match_type,
+        "input_per_1m": float(item.get("input_per_1m") or 0),
+        "output_per_1m": float(item.get("output_per_1m") or 0),
+        "cached_input_per_1m": float(item.get("cached_input_per_1m") or 0),
+        "per_image_usd": float(item.get("per_image_usd") or 0),
+        "per_step_usd": float(item.get("per_step_usd") or 0),
+        "unit": unit,
+        "priority": int(item.get("priority") or 20),
+        "enabled": bool(item.get("enabled", True)),
+        "note": item.get("note") or None,
+    }
+
+
+def _normalize_litellm_item(key: str, meta: dict) -> dict | None:
+    """LiteLLM 格式条目转标准。返回 None 表示跳过（非 Fireworks）。"""
+    # 只取 Fireworks 相关
+    is_fireworks = "fireworks" in key.lower() or (meta.get("litellm_provider") == "fireworks_ai")
+    if not is_fireworks:
+        return None
+    pattern = key.rsplit("/", 1)[-1].lower().strip()
+    if not pattern or pattern in ("fireworks_ai", "default"):
+        return None
+    inp = float(meta.get("input_cost_per_token") or 0) * 1_000_000
+    out = float(meta.get("output_cost_per_token") or 0) * 1_000_000
+    cached = float(meta.get("cache_read_input_token_cost") or 0) * 1_000_000
+    return {
+        "pattern": pattern,
+        "match_type": "contains",
+        "input_per_1m": inp,
+        "output_per_1m": out,
+        "cached_input_per_1m": cached,
+        "per_image_usd": 0.0,
+        "per_step_usd": 0.0,
+        "unit": "per_token",
+        "priority": 5,
+        "enabled": True,
+        "note": f"Imported from LiteLLM-style JSON ({key})",
+    }
+
+
+async def import_from_json(
+    session: AsyncSession,
+    data,
+    strategy: str = "skip",
+) -> ImportResult:
+    """从 JSON 数据导入价格条目。
+
+    支持两种格式（自动检测）：
+    1. 原生数组：[{pattern, match_type, input_per_1m, ...}, ...]
+    2. LiteLLM 字典：{"fireworks_ai/.../model": {input_cost_per_token, ...}}
+
+    strategy:
+    - "skip": 已存在同 pattern → 跳过（默认，最安全）
+    - "update": 已存在同 pattern → 用新数据覆盖
+    - "replace": 先清空所有 source=manual 的条目，再全部当 manual 插入
+    """
+    errors: list[str] = []
+    created = 0
+    updated = 0
+    skipped = 0
+
+    # 解析格式
+    items: list[dict] = []
+    if isinstance(data, list):
+        # 原生数组
+        for idx, raw in enumerate(data):
+            try:
+                if not isinstance(raw, dict):
+                    raise ValueError(f"item must be object, got {type(raw).__name__}")
+                items.append(_normalize_native_item(raw))
+            except (ValueError, TypeError) as e:
+                errors.append(f"item[{idx}]: {e}")
+    elif isinstance(data, dict) and _is_litellm_format(data):
+        # LiteLLM 字典
+        for k, meta in data.items():
+            try:
+                normalized = _normalize_litellm_item(k, meta)
+                if normalized is not None:
+                    items.append(normalized)
+            except (ValueError, TypeError) as e:
+                errors.append(f"'{k}': {e}")
+    elif isinstance(data, dict) and "items" in data and isinstance(data["items"], list):
+        # 兼容 {items: [...]} 包装
+        for idx, raw in enumerate(data["items"]):
+            try:
+                items.append(_normalize_native_item(raw))
+            except (ValueError, TypeError) as e:
+                errors.append(f"items[{idx}]: {e}")
+    else:
+        errors.append("Unrecognized JSON format. Expected array, LiteLLM dict, or {items:[...]}")
+        return ImportResult(0, 0, 0, 0, errors)
+
+    received = len(items)
+
+    # replace 模式先清 manual
+    if strategy == "replace":
+        existing_manual = list((await session.execute(
+            select(ModelPriceCatalog).where(ModelPriceCatalog.source == PriceSource.manual)
+        )).scalars().all())
+        for r in existing_manual:
+            await session.delete(r)
+        await session.flush()
+
+    # 处理每条
+    for n in items:
+        existing = (await session.execute(
+            select(ModelPriceCatalog).where(ModelPriceCatalog.pattern == n["pattern"])
+        )).scalar_one_or_none()
+
+        if existing is None or strategy == "replace":
+            session.add(ModelPriceCatalog(
+                pattern=n["pattern"],
+                match_type=PriceMatchType(n["match_type"]),
+                input_per_1m=n["input_per_1m"],
+                output_per_1m=n["output_per_1m"],
+                cached_input_per_1m=n["cached_input_per_1m"],
+                per_image_usd=n["per_image_usd"],
+                per_step_usd=n["per_step_usd"],
+                unit=PriceUnit(n["unit"]),
+                source=PriceSource.manual,
+                priority=n["priority"],
+                enabled=n["enabled"],
+                note=n["note"],
+            ))
+            created += 1
+        elif strategy == "update":
+            existing.input_per_1m = n["input_per_1m"]
+            existing.output_per_1m = n["output_per_1m"]
+            existing.cached_input_per_1m = n["cached_input_per_1m"]
+            existing.per_image_usd = n["per_image_usd"]
+            existing.per_step_usd = n["per_step_usd"]
+            existing.match_type = PriceMatchType(n["match_type"])
+            existing.unit = PriceUnit(n["unit"])
+            existing.priority = n["priority"]
+            existing.enabled = n["enabled"]
+            if n["note"]:
+                existing.note = n["note"]
+            existing.source = PriceSource.manual
+            updated += 1
+        else:  # skip
+            skipped += 1
+
+    return ImportResult(received, created, updated, skipped, errors)
+
+
+async def export_all_as_json(session: AsyncSession) -> list[dict]:
+    """导出所有价格条目为 JSON 数组（原生格式，可直接 import 回来）。"""
+    rows = list((await session.execute(
+        select(ModelPriceCatalog).order_by(ModelPriceCatalog.priority.desc(), ModelPriceCatalog.pattern)
+    )).scalars().all())
+    return [
+        {
+            "pattern": r.pattern,
+            "match_type": r.match_type.value,
+            "input_per_1m": r.input_per_1m,
+            "output_per_1m": r.output_per_1m,
+            "cached_input_per_1m": r.cached_input_per_1m,
+            "per_image_usd": r.per_image_usd,
+            "per_step_usd": r.per_step_usd,
+            "unit": r.unit.value,
+            "priority": r.priority,
+            "enabled": bool(r.enabled),
+            "note": r.note,
+        }
+        for r in rows
+    ]
+
+
 @dataclass
 class LiteLLMSyncResult:
     fetched_total: int          # LiteLLM 全量条目数

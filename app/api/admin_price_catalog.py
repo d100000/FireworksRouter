@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import desc, select
 
@@ -182,3 +182,71 @@ async def seed_initial(session: SessionDep) -> dict[str, int]:
     """把 hardcoded KNOWN_PRICES 灌入 DB（幂等：已存在 seed 条目则跳过）。"""
     inserted = await pc.seed_initial(session)
     return {"inserted": inserted}
+
+
+class ImportJsonIn(BaseModel):
+    data: Any                            # 可以是 list / dict（自动识别格式）
+    strategy: str = "skip"               # skip / update / replace
+
+
+@router.post("/import-json")
+async def import_json(payload: ImportJsonIn, session: SessionDep) -> dict[str, Any]:
+    """从 JSON 数据批量导入价格条目。
+
+    支持的 JSON 格式：
+
+    **格式 1 — 原生数组**（推荐，便于备份/迁移）：
+    ```
+    [
+      {
+        "pattern": "kimi-k2p6",
+        "match_type": "contains",
+        "input_per_1m": 0.55,
+        "output_per_1m": 2.20,
+        "cached_input_per_1m": 0.0,
+        "unit": "per_token",
+        "priority": 20,
+        "enabled": true,
+        "note": "Kimi K2.6 (manual)"
+      }
+    ]
+    ```
+
+    **格式 2 — LiteLLM 字典**（可以直接粘 LiteLLM 仓库的 JSON 片段）：
+    ```
+    {
+      "fireworks_ai/accounts/fireworks/models/kimi-k2p6": {
+        "input_cost_per_token": 0.00000055,
+        "output_cost_per_token": 0.0000022,
+        "litellm_provider": "fireworks_ai"
+      }
+    }
+    ```
+
+    **strategy 合并策略**：
+    - `skip`（默认）：pattern 已存在 → 跳过，最安全
+    - `update`：pattern 已存在 → 用新数据覆盖
+    - `replace`：先清空所有 source=manual 的条目，再全部以 manual 插入
+    """
+    if payload.strategy not in ("skip", "update", "replace"):
+        raise HTTPException(
+            status_code=400, detail=f"invalid strategy: {payload.strategy}"
+        )
+    result = await pc.import_from_json(session, payload.data, payload.strategy)
+    return {
+        "received": result.received,
+        "created": result.created,
+        "updated": result.updated,
+        "skipped": result.skipped,
+        "errors": result.errors,
+    }
+
+
+@router.get("/export-json")
+async def export_json(session: SessionDep) -> dict[str, Any]:
+    """导出所有价格条目为 JSON 数组（原生格式，可直接 import 回来）。
+
+    用法：管理员先导出当前价格表 → 在本地修改 JSON → 再 import-json 恢复。
+    """
+    items = await pc.export_all_as_json(session)
+    return {"count": len(items), "items": items}

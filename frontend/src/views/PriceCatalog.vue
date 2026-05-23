@@ -29,6 +29,14 @@
             <template #icon><n-icon><CloudDownloadOutline /></n-icon></template>
             从 LiteLLM 同步
           </n-button>
+          <n-button @click="openImport" size="small">
+            <template #icon><n-icon><DocumentAttachOutline /></n-icon></template>
+            导入 JSON
+          </n-button>
+          <n-button @click="doExport" size="small">
+            <template #icon><n-icon><DownloadOutline /></n-icon></template>
+            导出 JSON
+          </n-button>
           <n-button @click="load" size="small">刷新</n-button>
         </n-space>
       </n-space>
@@ -149,14 +157,136 @@
         </n-space>
       </template>
     </n-modal>
+
+    <!-- 导入 JSON 弹窗 -->
+    <n-modal v-model:show="importShow" preset="card" title="导入 JSON 价格" style="width: 720px">
+      <n-tabs v-model:value="importTab" type="line">
+        <n-tab-pane name="paste" tab="粘贴 JSON">
+          <n-input
+            v-model:value="importText"
+            type="textarea"
+            placeholder='[{"pattern": "kimi-k2p6", "input_per_1m": 0.55, "output_per_1m": 2.2}]'
+            :rows="14"
+            style="font-family: ui-monospace, Menlo, monospace"
+          />
+        </n-tab-pane>
+        <n-tab-pane name="file" tab="上传文件">
+          <n-upload
+            :default-upload="false"
+            accept=".json,application/json"
+            :max="1"
+            @change="onFileSelected"
+            list-type="text"
+          >
+            <n-upload-dragger>
+              <div style="padding: 24px 0; text-align: center">
+                <n-icon size="48" :depth="3"><DocumentAttachOutline /></n-icon>
+                <div style="margin-top: 8px; font-size: 13px">点击或拖拽 .json 文件到此处</div>
+              </div>
+            </n-upload-dragger>
+          </n-upload>
+        </n-tab-pane>
+        <n-tab-pane name="docs" tab="📖 格式说明">
+          <n-text depth="3" style="font-size: 13px; display: block; margin-bottom: 8px">
+            支持两种 JSON 格式，后端自动识别。粘贴或上传任一种即可。
+          </n-text>
+
+          <n-divider style="margin: 12px 0 8px 0"><b>格式 1 — 原生数组（推荐）</b></n-divider>
+          <n-code :code="exampleNative" language="json" :word-wrap="true" />
+
+          <n-divider style="margin: 16px 0 8px 0"><b>格式 2 — LiteLLM 字典</b>（可直接粘 LiteLLM 仓库片段）</n-divider>
+          <n-code :code="exampleLitellm" language="json" :word-wrap="true" />
+
+          <n-divider style="margin: 16px 0 8px 0"><b>字段说明（原生格式）</b></n-divider>
+          <n-table :bordered="false" size="small" style="font-size: 12px">
+            <thead>
+              <tr><th>字段</th><th>类型</th><th>必填</th><th>说明</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>pattern</code></td><td>string</td><td>✓</td><td>匹配模式，如 <code>kimi-k2p6</code>；模糊匹配模型尾名</td></tr>
+              <tr><td><code>match_type</code></td><td>string</td><td></td><td><code>exact</code> / <code>contains</code>(默认) / <code>prefix</code></td></tr>
+              <tr><td><code>input_per_1m</code></td><td>number</td><td>✓</td><td>输入价格 $ / 1M tokens</td></tr>
+              <tr><td><code>output_per_1m</code></td><td>number</td><td>✓</td><td>输出价格 $ / 1M tokens</td></tr>
+              <tr><td><code>cached_input_per_1m</code></td><td>number</td><td></td><td>缓存命中价（可选）</td></tr>
+              <tr><td><code>per_image_usd</code></td><td>number</td><td></td><td>图像生成单价（unit=per_image 时用）</td></tr>
+              <tr><td><code>per_step_usd</code></td><td>number</td><td></td><td>扩散单步价（unit=per_step 时用）</td></tr>
+              <tr><td><code>unit</code></td><td>string</td><td></td><td><code>per_token</code>(默认) / <code>per_image</code> / <code>per_step</code> / <code>per_request</code></td></tr>
+              <tr><td><code>priority</code></td><td>int</td><td></td><td>越大越优先（默认 20）。seed=10 / litellm=5</td></tr>
+              <tr><td><code>enabled</code></td><td>bool</td><td></td><td>默认 true</td></tr>
+              <tr><td><code>note</code></td><td>string</td><td></td><td>备注</td></tr>
+            </tbody>
+          </n-table>
+        </n-tab-pane>
+      </n-tabs>
+
+      <n-divider style="margin: 16px 0" />
+      <n-form>
+        <n-form-item label="合并策略" label-placement="left">
+          <n-radio-group v-model:value="importStrategy" name="strategy">
+            <n-space>
+              <n-radio value="skip"><b>skip</b>（已存在 pattern → 跳过；最安全）</n-radio>
+              <n-radio value="update"><b>update</b>（已存在 → 覆盖更新）</n-radio>
+              <n-radio value="replace"><b>replace</b>（先清空所有 manual，再全量插入）</n-radio>
+            </n-space>
+          </n-radio-group>
+        </n-form-item>
+      </n-form>
+
+      <template #footer>
+        <n-space justify="end">
+          <n-button @click="importShow = false">取消</n-button>
+          <n-button type="primary" :loading="importing" @click="doImport" :disabled="!importText.trim() && importTab !== 'file'">导入</n-button>
+        </n-space>
+      </template>
+    </n-modal>
   </n-space>
 </template>
 
 <script setup>
 import { ref, h, onMounted, reactive } from 'vue'
 import { NTag, NButton, NPopconfirm, NSpace, NIcon, useMessage, useDialog } from 'naive-ui'
-import { CloudDownloadOutline } from '@vicons/ionicons5'
+import { CloudDownloadOutline, DocumentAttachOutline, DownloadOutline } from '@vicons/ionicons5'
 import { priceCatalogApi } from '@/api'
+
+const exampleNative = `[
+  {
+    "pattern": "kimi-k2p6",
+    "match_type": "contains",
+    "input_per_1m": 0.55,
+    "output_per_1m": 2.20,
+    "unit": "per_token",
+    "priority": 20,
+    "note": "Kimi K2.6 — manual override"
+  },
+  {
+    "pattern": "deepseek-v4-pro",
+    "input_per_1m": 1.74,
+    "output_per_1m": 3.48,
+    "cached_input_per_1m": 0.174
+  },
+  {
+    "pattern": "flux-kontext-max",
+    "unit": "per_image",
+    "per_image_usd": 0.08,
+    "input_per_1m": 0,
+    "output_per_1m": 0,
+    "note": "FLUX.1 Kontext Max — per image $0.08"
+  }
+]`
+
+const exampleLitellm = `{
+  "fireworks_ai/accounts/fireworks/models/kimi-k2p6": {
+    "input_cost_per_token": 0.00000055,
+    "output_cost_per_token": 0.0000022,
+    "litellm_provider": "fireworks_ai"
+  },
+  "fireworks_ai/accounts/fireworks/models/deepseek-v4-pro": {
+    "input_cost_per_token": 0.00000174,
+    "output_cost_per_token": 0.00000348,
+    "cache_read_input_token_cost": 0.000000174,
+    "litellm_provider": "fireworks_ai"
+  }
+}`
 
 const message = useMessage()
 const dialog = useDialog()
@@ -320,6 +450,82 @@ async function remove(id) {
 function openSyncModal() {
   overwriteMode.value = false
   syncModalShow.value = true
+}
+
+// ============= 导入 JSON =============
+const importShow = ref(false)
+const importTab = ref('paste')
+const importText = ref('')
+const importStrategy = ref('skip')
+const importing = ref(false)
+
+function openImport() {
+  importText.value = ''
+  importTab.value = 'paste'
+  importStrategy.value = 'skip'
+  importShow.value = true
+}
+
+async function onFileSelected({ file }) {
+  if (!file || !file.file) return
+  try {
+    const text = await file.file.text()
+    importText.value = text
+    importTab.value = 'paste'
+    message.success(`已加载文件 ${file.name}（${(text.length / 1024).toFixed(1)} KB）`)
+  } catch (e) {
+    message.error('读取文件失败：' + e.message)
+  }
+}
+
+async function doImport() {
+  if (!importText.value.trim()) {
+    message.warning('请先粘贴或上传 JSON')
+    return
+  }
+  let data
+  try {
+    data = JSON.parse(importText.value)
+  } catch (e) {
+    message.error('JSON 解析失败：' + e.message)
+    return
+  }
+  importing.value = true
+  try {
+    const { data: result } = await priceCatalogApi.importJson(data, importStrategy.value)
+    const summary = `收到 ${result.received} / 新建 ${result.created} / 更新 ${result.updated} / 跳过 ${result.skipped}`
+    message.success(summary, { duration: 6000 })
+    if (result.errors?.length) {
+      dialog.warning({
+        title: `导入有 ${result.errors.length} 条错误`,
+        content: result.errors.slice(0, 10).join('\n'),
+      })
+    }
+    importShow.value = false
+    await load()
+  } catch (e) {
+    message.error(e?.response?.data?.detail || '导入失败')
+  } finally { importing.value = false }
+}
+
+// ============= 导出 JSON =============
+async function doExport() {
+  try {
+    const { data } = await priceCatalogApi.exportJson()
+    const json = JSON.stringify(data.items, null, 2)
+    const blob = new Blob([json], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `fireworkrouter-price-catalog-${new Date().toISOString().slice(0, 10)}.json`
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    URL.revokeObjectURL(url)
+    message.success(`已下载 ${data.count} 条价格条目`)
+  } catch (e) {
+    message.error('导出失败：' + e.message)
+  }
 }
 
 async function doSync() {

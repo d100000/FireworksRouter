@@ -49,6 +49,9 @@ export const priceCatalogApi = {
   syncLitellm: (overwrite = false) =>
     api.post('/admin/price-catalog/sync-litellm', null, { params: { overwrite_existing: overwrite } }),
   seed: () => api.post('/admin/price-catalog/seed'),
+  importJson: (data, strategy = 'skip') =>
+    api.post('/admin/price-catalog/import-json', { data, strategy }),
+  exportJson: () => api.get('/admin/price-catalog/export-json'),
 }
 
 export const logsApi = {
