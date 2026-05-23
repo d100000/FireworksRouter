@@ -324,16 +324,18 @@ def _translate_assistant_message(content: Any) -> dict[str, Any]:
 def _translate_tools(tools: Any) -> list[dict[str, Any]]:
     """Anthropic tools → OpenAI tools（包装成 type=function）。
 
-    顺便对 input_schema 做 JSON Schema 消毒：剥掉 Fireworks RE2 不支持的
-    lookahead / lookbehind / backreference。详见 utils/json_schema.py。
+    顺便对 input_schema 做 JSON Schema 消毒：
+      1. inline_refs：展开 $ref / $defs（Fireworks resolver 有 NoneType bug）
+      2. sanitize_patterns：剥 lookahead/lookbehind/backref（RE2 不支持）
+    详见 utils/json_schema.py。
     """
     if not isinstance(tools, list):
         return []
-    from app.utils.json_schema import sanitize_patterns
+    from app.utils.json_schema import inline_refs, sanitize_patterns
     from app.utils.logger import logger
 
     out: list[dict[str, Any]] = []
-    stripped_all: list[str] = []
+    notes_all: list[str] = []
     for t in tools:
         if not isinstance(t, dict):
             continue
@@ -341,10 +343,14 @@ def _translate_tools(tools: Any) -> list[dict[str, Any]]:
         if not name:
             continue
         params = t.get("input_schema") or {"type": "object", "properties": {}}
-        stripped: list[str] = []
-        sanitize_patterns(params, stripped)
-        if stripped:
-            stripped_all.extend(f"tool[{name}] {s}" for s in stripped)
+        notes: list[str] = []
+        # 1. 先 inline $ref
+        params, ref_notes = inline_refs(params)
+        notes.extend(ref_notes)
+        # 2. 再剥不支持的 pattern
+        sanitize_patterns(params, notes)
+        if notes:
+            notes_all.extend(f"tool[{name}] {n}" for n in notes)
         out.append({
             "type": "function",
             "function": {
@@ -353,10 +359,10 @@ def _translate_tools(tools: Any) -> list[dict[str, Any]]:
                 "parameters": params,
             },
         })
-    if stripped_all:
+    if notes_all:
         logger.warning(
-            "anthropic tools: stripped {} unsupported regex pattern(s) — first 3: {}",
-            len(stripped_all), stripped_all[:3],
+            "anthropic tools: schema sanitized {} item(s) — first 3: {}",
+            len(notes_all), notes_all[:3],
         )
     return out
 

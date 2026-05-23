@@ -93,15 +93,14 @@ def _parse_sse_usage(line_bytes: bytes) -> GatewayUsage | None:
 def _friendlify_upstream_error(msg: str, status: int) -> str:
     """已知的上游报错模式 → 给客户端更可操作的提示。
 
-    目前命中规则：
-      - "Regex lookahead/lookbehind/backreferences not supported in JSON Schema pattern"
-        → 提示客户端 tool schema 含 RE2 不支持的正则；我们已经自动剥过一遍，
-          如果还报这个就说明在我们检测之外的位置（如 description 里嵌套 schema、
-          或 escape 形态我们没匹配），给出 hint。
+    命中规则：
+      - Regex lookahead/lookbehind/backreferences not supported
+      - Error resolving schema reference '#/$defs/...'（Fireworks resolver bug）
     """
     if status != 400 or not msg:
         return msg
     low = msg.lower()
+
     if (
         "regex lookahead" in low
         or "regex lookbehind" in low
@@ -117,6 +116,21 @@ def _friendlify_upstream_error(msg: str, status: int) -> str:
             "但仍有未覆盖的位置 — 请检查你的工具 schema（含嵌套 oneOf/anyOf/items 等），"
             "把含 (?=...)/(?!...)/(?<=...)/(?<!...)/\\N 的 pattern 简化或移除。"
         )
+
+    if (
+        "error resolving schema reference" in low
+        or "schema reference '#/" in low
+        or "'noneType' object has no attribute 'lookup'".lower() in low  # 上游 resolver bug 的具体异常签名
+    ):
+        return (
+            f"{msg}\n\n[gateway hint] "
+            "Fireworks 上游 schema resolver 解析 $ref/$defs 时出错（上游 bug）。"
+            "网关已尝试把 tool input_schema 里 #/$defs/* 和 #/definitions/* 的 $ref 全部内联展开，"
+            "但仍有未覆盖的位置 — 检查工具 schema 是否有：① 外部 $ref（http://...）；"
+            "② $ref 指向 $defs 之外的位置（如 #/properties/X）；③ 客户端在 SDK 层 escape 后形态变化。"
+            "把这些 $ref 改成内联结构或简化掉即可。"
+        )
+
     return msg
 
 
