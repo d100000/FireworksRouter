@@ -59,7 +59,56 @@ router = APIRouter(tags=["anthropic"])
 
 # Anthropic 专属字段，OpenAI 上游会报 "Extra inputs are not permitted"
 _ANTHROPIC_ONLY_BLOCK_FIELDS = {"cache_control", "cache_creation"}
-_ANTHROPIC_ONLY_TOP_LEVEL = {"metadata", "anthropic_version", "anthropic_beta"}
+
+# Anthropic 错误类型映射（OpenAI 错误类型 / HTTP 状态 → Anthropic error.type）
+# 参考 https://docs.anthropic.com/en/api/errors
+_ANTHROPIC_ERROR_TYPE_BY_STATUS = {
+    400: "invalid_request_error",
+    401: "authentication_error",
+    403: "permission_error",
+    404: "not_found_error",
+    413: "request_too_large",
+    422: "invalid_request_error",
+    429: "rate_limit_error",
+    500: "api_error",
+    502: "api_error",
+    503: "overloaded_error",
+    504: "api_error",
+}
+
+
+def _to_anthropic_error_response(openai_err_resp):
+    """把 OpenAI 错误响应 (`{"error": {message, type, code}}`) 包成 Anthropic 形态
+    (`{"type": "error", "error": {type, message}}`)。
+
+    Anthropic SDK 会按 `error.type` 抛特定异常（AuthenticationError 等），
+    不正确的 type 会让客户端只能看到 generic "API Error"。
+    """
+    from fastapi.responses import JSONResponse
+
+    try:
+        payload = json.loads(openai_err_resp.body) if isinstance(openai_err_resp, JSONResponse) else {}
+    except (json.JSONDecodeError, ValueError):
+        payload = {}
+
+    err = payload.get("error") or {}
+    message = err.get("message") or "Unknown error"
+    status = openai_err_resp.status_code if hasattr(openai_err_resp, "status_code") else 500
+    err_type = _ANTHROPIC_ERROR_TYPE_BY_STATUS.get(status, "api_error")
+
+    # 只保留对 Anthropic 客户端有意义的头（Retry-After、X-Fwr-Request-Id）
+    safe_headers = {}
+    if hasattr(openai_err_resp, "headers"):
+        for k in ("retry-after", "x-fwr-request-id"):
+            v = openai_err_resp.headers.get(k)
+            if v:
+                safe_headers[k] = v
+
+    return JSONResponse(
+        status_code=status,
+        content={"type": "error", "error": {"type": err_type, "message": message}},
+        headers=safe_headers,
+    )
 
 
 async def _resolve_api_key(
@@ -450,33 +499,47 @@ async def _handle_anthropic_messages(
     authorization: str | None,
     x_api_key: str | None,
 ):
-    """统一入口：/v1/messages 和 /v1/message 都走这里。"""
+    """统一入口：/v1/messages 和 /v1/message 都走这里。
+
+    所有错误响应都包成 Anthropic envelope（`{type:error, error:{type,message}}`），
+    避免客户端解析失败。
+    """
     # 1. 鉴权
     try:
         api_key = await _resolve_api_key(session, authorization=authorization, x_api_key=x_api_key)
     except gw_errors.AuthenticationError as e:
-        return gw_errors.to_error_response(e)
+        return _to_anthropic_error_response(gw_errors.to_error_response(e))
 
-    # 2. 读 body
+    # 2. 读 body（必须是 JSON object）
     try:
         raw = await request.body()
         body = json.loads(raw) if raw else {}
     except json.JSONDecodeError:
-        return gw_errors.to_error_response(
-            gw_errors.InvalidRequestError("Invalid JSON body")
+        return _to_anthropic_error_response(
+            gw_errors.to_error_response(gw_errors.InvalidRequestError("Invalid JSON body"))
+        )
+    if not isinstance(body, dict):
+        return _to_anthropic_error_response(
+            gw_errors.to_error_response(
+                gw_errors.InvalidRequestError("Request body must be a JSON object")
+            )
         )
 
     requested_model = body.get("model")
     if not requested_model:
-        return gw_errors.to_error_response(
-            gw_errors.InvalidRequestError("Missing required parameter: model", param="model")
+        return _to_anthropic_error_response(
+            gw_errors.to_error_response(
+                gw_errors.InvalidRequestError("Missing required parameter: model", param="model")
+            )
         )
 
     # 3. 模型解析
     resolved = await models_svc.resolve(session, requested_model)
     if resolved.record is not None and resolved.record.status.value != "active":
-        return gw_errors.to_error_response(
-            gw_errors.ModelNotFoundError(f"Model '{requested_model}' is disabled")
+        return _to_anthropic_error_response(
+            gw_errors.to_error_response(
+                gw_errors.ModelNotFoundError(f"Model '{requested_model}' is disabled")
+            )
         )
 
     # 4. Anthropic → OpenAI 请求体转换
@@ -486,7 +549,6 @@ async def _handle_anthropic_messages(
     return await _forward_anthropic(
         request=request,
         api_key=api_key,
-        anthropic_body=body,
         openai_body=openai_body,
         resolved=resolved,
         is_stream=is_stream,
@@ -517,10 +579,14 @@ async def anthropic_messages_singular(
     return await _handle_anthropic_messages(request, session, authorization, x_api_key)
 
 
+# 从上游响应里只挑选 Anthropic 客户端有意义的头透传，不要带 content-length /
+# content-type，否则会让客户端按错的长度截断（OpenAI body 体积 ≠ Anthropic body 体积）
+_FORWARD_RESPONSE_HEADERS = {"x-fwr-request-id", "x-fwr-upstream-preview"}
+
+
 async def _forward_anthropic(
     request: Request,
     api_key: ApiKey,
-    anthropic_body: dict,
     openai_body: dict,
     resolved,
     is_stream: bool,
@@ -560,24 +626,38 @@ async def _forward_anthropic(
         allow_stream=False,
     )
 
-    # 非 2xx：原样透传错误（已经是 OpenAI 错误结构）
     if not isinstance(resp, JSONResponse):
+        # 不应该走到（allow_stream=False），保险起见原样透传
         return resp
     if resp.status_code >= 400:
-        return resp
+        # 错误响应包装成 Anthropic envelope
+        return _to_anthropic_error_response(resp)
+
+    # 只挑选少量请求追踪头透传，丢弃上游的 content-length/content-type
+    safe_headers = {k: v for k, v in resp.headers.items() if k.lower() in _FORWARD_RESPONSE_HEADERS}
 
     # 解析 OpenAI 响应 → 转换为 Anthropic
-    body_dict = json.loads(resp.body)
+    try:
+        body_dict = json.loads(resp.body) if resp.body else {}
+    except json.JSONDecodeError:
+        return _to_anthropic_error_response(
+            gw_errors.to_error_response(
+                gw_errors.UpstreamError("Failed to parse upstream response as JSON")
+            )
+        )
     anthropic_resp = _openai_to_anthropic_response(body_dict)
 
     if not is_stream:
-        return JSONResponse(content=anthropic_resp, status_code=200, headers=dict(resp.headers))
+        return JSONResponse(content=anthropic_resp, status_code=200, headers=safe_headers)
 
     # 流式：把整段拆成 Anthropic SSE events
+    stream_headers = dict(safe_headers)
+    stream_headers["Cache-Control"] = "no-cache"
+    stream_headers["X-Accel-Buffering"] = "no"
     return StreamingResponse(
         _anthropic_stream_events(anthropic_resp),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        headers=stream_headers,
     )
 
 
