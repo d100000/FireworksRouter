@@ -547,6 +547,7 @@ async def list_request_logs(
                 "raw_cost_usd": r.raw_cost_usd, "billed_cost_usd": r.billed_cost_usd,
                 "rate_multiplier": r.rate_multiplier,
                 "status_code": r.status_code, "error_code": r.error_code,
+                "error_message": r.error_message,
                 "retry_count": r.retry_count,
                 "ttft_ms": r.ttft_ms, "latency_ms": r.latency_ms,
                 "created_at": r.created_at,

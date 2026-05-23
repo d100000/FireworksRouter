@@ -103,11 +103,37 @@
 
 <script setup>
 import { ref, h, onMounted, reactive, computed } from 'vue'
-import { NTag, NSpace, NDescriptions, NDescriptionsItem, NCode, NDivider, NPopconfirm, useMessage } from 'naive-ui'
+import { NTag, NSpace, NDescriptions, NDescriptionsItem, NCode, NDivider, NPopconfirm, NTooltip, NButton, useMessage } from 'naive-ui'
 import { logsApi, modelApi, upstreamApi, apiKeysApi } from '@/api'
 import dayjs from 'dayjs'
 
 const message = useMessage()
+
+function copyToClipboard(text) {
+  if (!text) return
+  // 优先 navigator.clipboard（HTTPS/localhost）
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text)
+      .then(() => message.success('已复制到剪贴板'))
+      .catch(() => message.error('复制失败'))
+    return
+  }
+  // fallback for http(非 localhost)：execCommand
+  const ta = document.createElement('textarea')
+  ta.value = text
+  ta.style.position = 'fixed'
+  ta.style.opacity = '0'
+  document.body.appendChild(ta)
+  ta.select()
+  try {
+    document.execCommand('copy')
+    message.success('已复制到剪贴板')
+  } catch {
+    message.error('复制失败')
+  } finally {
+    document.body.removeChild(ta)
+  }
+}
 
 const rows = ref([])
 const loading = ref(false)
@@ -288,10 +314,37 @@ const columns = computed(() => [
       : '-',
   },
   {
-    title: '类型', key: 'status_code', width: 110,
+    title: '类型 / 错误', key: 'status_code', width: 260,
     render: (r) => {
       const b = statusBadge(r)
-      return h(NTag, { size: 'small', type: b.type, bordered: false }, () => b.label)
+      const tag = h(NTag, { size: 'small', type: b.type, bordered: false }, () => b.label)
+      const hasErr = !!(r.error_code || r.error_message)
+      if (!hasErr) {
+        return tag
+      }
+      // 失败请求：标签 + 错误码/前 80 字符 message 直接展示，hover 看完整 detail
+      const codeChip = r.error_code
+        ? h(NTag, { size: 'tiny', bordered: false, type: 'error', style: 'margin-left:4px' },
+            () => r.error_code)
+        : null
+      const msgPreview = r.error_message
+        ? String(r.error_message).slice(0, 80) + (r.error_message.length > 80 ? '…' : '')
+        : ''
+      return h('div', { style: 'line-height:1.4' }, [
+        h(NSpace, { size: 4, wrap: false, align: 'center' }, () => [tag, codeChip].filter(Boolean)),
+        msgPreview
+          ? h(NTooltip, { placement: 'top', style: 'max-width:560px' }, {
+              trigger: () => h('div', {
+                style: 'margin-top:3px;font-size:11.5px;color:#dc2626;cursor:help;' +
+                       'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:240px',
+              }, msgPreview),
+              default: () => h('pre', {
+                style: 'margin:0;font-size:11.5px;white-space:pre-wrap;word-break:break-all;' +
+                       'max-height:360px;overflow:auto;line-height:1.5',
+              }, r.error_message),
+            })
+          : null,
+      ].filter(Boolean))
     },
   },
   {
@@ -347,10 +400,31 @@ function renderExpand(r) {
         h('span', null, `输入 ${r.prompt_tokens} tokens · 输出 ${r.completion_tokens} tokens${r.cached_tokens ? ` · 缓存命中 ${r.cached_tokens} tokens` : ''} · 合计 ${r.total_tokens || (r.prompt_tokens + r.completion_tokens)} tokens`)),
       h(NDescriptionsItem, { label: '计费过程', span: 3 }, () => formula),
       r.error_code || r.error_message
-        ? h(NDescriptionsItem, { label: '错误', span: 3 }, () =>
-            h('div', { style: 'color:#ef4444' }, [
-              h('div', { style: 'font-weight:600' }, r.error_code || ''),
-              h('pre', { style: 'margin:4px 0 0 0;font-size:11px;white-space:pre-wrap;word-break:break-all' }, r.error_message || ''),
+        ? h(NDescriptionsItem, { label: '错误详情', span: 3 }, () =>
+            h('div', {
+              style: 'background:rgba(239,68,68,0.06);border-left:3px solid #ef4444;' +
+                     'border-radius:4px;padding:8px 10px',
+            }, [
+              h('div', { style: 'display:flex;align-items:center;gap:8px;margin-bottom:6px' }, [
+                r.error_code
+                  ? h(NTag, { size: 'small', type: 'error', bordered: false }, () => r.error_code)
+                  : null,
+                h('span', { style: 'color:#ef4444;font-weight:600;font-size:12px' },
+                  `HTTP ${r.status_code}`),
+                r.error_message
+                  ? h(NButton, {
+                      size: 'tiny', text: true, type: 'error',
+                      onClick: () => copyToClipboard(r.error_message),
+                    }, () => '📋 复制')
+                  : null,
+              ].filter(Boolean)),
+              r.error_message
+                ? h('pre', {
+                    style: 'margin:0;font-size:11.5px;line-height:1.55;color:#7f1d1d;' +
+                           'white-space:pre-wrap;word-break:break-all;' +
+                           'max-height:400px;overflow:auto;font-family:ui-monospace,Menlo,monospace',
+                  }, r.error_message)
+                : h('span', { style: 'color:#94a3b8;font-size:12px' }, '(无详细信息)'),
             ]))
         : null,
     ].filter(Boolean)),
