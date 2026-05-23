@@ -38,8 +38,10 @@ class QuotaSnapshot:
 def _client(timeout: float = 15.0) -> httpx.AsyncClient:
     """Fireworks 管理 API 客户端。
 
-    管理 API（accounts/quotas）一般 < 2s 响应，15s 超时已足够防御异常网络。
-    connect 5s 用于快速失败：连不上 Fireworks 控制面的话立即返回，不要拖到 10s。
+    默认 15s 用于轻量调用（list_models 等）。
+    余额查询相关（list_accounts / list_quotas / get_account）显式用更长超时
+    （BALANCE_QUERY_TIMEOUT_S），兜底网络抖动 / 控制面慢响应的场景。
+    connect 5s 用于快速失败：连不上控制面立即返回。
     """
     return httpx.AsyncClient(
         timeout=httpx.Timeout(timeout, connect=5.0),
@@ -48,12 +50,17 @@ def _client(timeout: float = 15.0) -> httpx.AsyncClient:
     )
 
 
+# 余额查询专用超时（list_accounts / list_quotas / get_account）。
+# 普通情况下 Fireworks 控制面 1-2s 响应；这里设 160s 是为兜底极端网络场景。
+BALANCE_QUERY_TIMEOUT_S = 160.0
+
+
 def _strip_account_prefix(name: str) -> str:
     return name.removeprefix("accounts/")
 
 
 async def list_accounts(api_key: str) -> list[AccountInfo]:
-    async with _client() as c:
+    async with _client(timeout=BALANCE_QUERY_TIMEOUT_S) as c:
         resp = await c.get(
             f"{settings.fireworks_admin_base_url}/accounts",
             headers={"Authorization": f"Bearer {api_key}"},
@@ -77,7 +84,7 @@ async def list_accounts(api_key: str) -> list[AccountInfo]:
 
 
 async def get_account(api_key: str, account_id: str) -> AccountInfo:
-    async with _client() as c:
+    async with _client(timeout=BALANCE_QUERY_TIMEOUT_S) as c:
         resp = await c.get(
             f"{settings.fireworks_admin_base_url}/accounts/{account_id}",
             params={"readMask": "*"},
@@ -97,7 +104,7 @@ async def get_account(api_key: str, account_id: str) -> AccountInfo:
 
 
 async def list_quotas(api_key: str, account_id: str) -> QuotaSnapshot:
-    async with _client() as c:
+    async with _client(timeout=BALANCE_QUERY_TIMEOUT_S) as c:
         resp = await c.get(
             f"{settings.fireworks_admin_base_url}/accounts/{account_id}/quotas",
             headers={"Authorization": f"Bearer {api_key}"},
