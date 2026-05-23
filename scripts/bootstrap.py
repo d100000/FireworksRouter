@@ -30,6 +30,22 @@ DEFAULT_PASSWORD = "admin1234"
 BCRYPT_MAX_BYTES = 72
 
 
+def _quote_env_value(val: str) -> str:
+    """把值用单引号包裹，让 docker-compose 不展开里面的 $。
+
+    bcrypt 哈希形如 `$2b$12$xxx`，docker-compose / dotenv 会把 `$2b` `$12`
+    当成 `${2b}` `${12}` 变量引用（不存在 → 空串），导致容器收到的密码 hash 为空。
+    docker-compose 和 python-dotenv 都识别单引号包裹，引号内 $ 不展开，
+    且引号本身会被剥离 → 应用拿到的就是原始 hash。
+
+    如果值本身含单引号（极罕见），改用双引号 + 转义 $。
+    """
+    if "'" not in val:
+        return f"'{val}'"
+    # 兜底：双引号 + 转义 $（docker-compose 双引号内 $ 仍展开，需要转义）
+    return '"' + val.replace("\\", "\\\\").replace('"', '\\"').replace("$", "$$") + '"'
+
+
 def _replace_env_var(text: str, var_name: str, new_value: str) -> tuple[str, bool]:
     """替换 .env 文件中某个变量的值。
 
@@ -38,8 +54,10 @@ def _replace_env_var(text: str, var_name: str, new_value: str) -> tuple[str, boo
 
     返回 (新文本, 是否替换成功)。
     """
-    # 转义 new_value 中的反斜杠（re.sub 替换串里 \ 是特殊字符）
-    escaped_value = new_value.replace("\\", "\\\\")
+    # 所有秘密值统一用单引号包裹（防 $ 被 docker-compose 误展开）
+    quoted = _quote_env_value(new_value)
+    # 替换串里 \ 需转义
+    escaped_value = quoted.replace("\\", "\\\\")
     pattern = re.compile(rf"^{re.escape(var_name)}=.*$", re.MULTILINE)
     new_text, count = pattern.subn(f"{var_name}={escaped_value}", text, count=1)
     return new_text, count > 0
@@ -96,8 +114,9 @@ def main() -> None:
     for var, val in replacements:
         out, replaced = _replace_env_var(out, var, val)
         if not replaced:
-            # .env.example 缺这个字段；追加到文末
-            out = out.rstrip("\r\n") + f"\n{var}={val}\n"
+            # .env.example 缺这个字段；追加到文末（同样加单引号）
+            quoted = _quote_env_value(val)
+            out = out.rstrip("\r\n") + f"\n{var}={quoted}\n"
             missing.append(var)
 
     if missing:

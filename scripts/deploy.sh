@@ -122,10 +122,14 @@ fi
 
 # ============== 4. 启动 Docker 服务 ==============
 info "拉取镜像 + 构建 + 启动..."
+
+# 检测是否要启用 HTTPS profile
+# .env 里的 DOMAIN 值可能被单引号包裹（bootstrap.py 加的防御），先剥引号再判断
 COMPOSE_ARGS=""
-if grep -q '^DOMAIN=' .env 2>/dev/null && [ -n "$(grep '^DOMAIN=' .env | cut -d= -f2)" ]; then
+DOMAIN_VAL=$(grep '^DOMAIN=' .env 2>/dev/null | cut -d= -f2- | sed -e "s/^['\"]//" -e "s/['\"]$//")
+if [ -n "$DOMAIN_VAL" ]; then
     COMPOSE_ARGS="--profile https"
-    info "检测到 DOMAIN 配置：将启用 Caddy HTTPS"
+    info "检测到 DOMAIN=${DOMAIN_VAL}：启用 Caddy HTTPS"
 fi
 
 docker compose ${COMPOSE_ARGS} pull postgres redis 2>/dev/null || true

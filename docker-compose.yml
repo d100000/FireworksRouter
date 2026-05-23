@@ -119,6 +119,11 @@ services:
   # ========== 可选：Caddy 自动 HTTPS（profiles 控制启停） ==========
   # 启用方式（在 .env 设置 DOMAIN=your.domain.com 后）：
   #   docker compose --profile https up -d
+  #
+  # 注意：即使不启用 https profile，docker-compose 仍会预解析所有服务的 environment
+  # 字段。所以这里**不能**用 `${DOMAIN:?error_msg}` 强制要求 — 那会让无 HTTPS 部署
+  # 也启动失败。改用 `${DOMAIN:-}` 默认空字符串；当真正启用 caddy profile 时由
+  # deploy.sh / 启动前检查保证 DOMAIN 非空。
   caddy:
     image: caddy:2-alpine
     container_name: fwr-caddy
@@ -127,7 +132,7 @@ services:
     depends_on:
       - api
     environment:
-      DOMAIN: ${DOMAIN:?启用 https profile 需在 .env 设置 DOMAIN=your.domain.com}
+      DOMAIN: ${DOMAIN:-}
       EMAIL: ${ACME_EMAIL:-}
     ports:
       - "80:80"
