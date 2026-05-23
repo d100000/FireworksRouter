@@ -92,6 +92,20 @@ def _sanitize_openai_request(body: Any) -> Any:
                 m["content"] = normalized_blocks
         cleaned.append(m)
     body["messages"] = cleaned
+
+    # tools 里的 JSON Schema pattern 消毒（剥 lookahead/lookbehind/backref）
+    # 上游 Fireworks 用 RE2 不支持这些；客户端发了网关就帮忙剥，不要让请求白白挂掉
+    tools = body.get("tools")
+    if isinstance(tools, list):
+        from app.utils.json_schema import sanitize_openai_tools
+        from app.utils.logger import logger
+        _, stripped = sanitize_openai_tools(tools)
+        if stripped:
+            logger.warning(
+                "openai tools: stripped {} unsupported regex pattern(s) — first 3: {}",
+                len(stripped), stripped[:3],
+            )
+
     return body
 
 

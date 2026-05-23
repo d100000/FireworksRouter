@@ -90,6 +90,36 @@ def _parse_sse_usage(line_bytes: bytes) -> GatewayUsage | None:
     )
 
 
+def _friendlify_upstream_error(msg: str, status: int) -> str:
+    """已知的上游报错模式 → 给客户端更可操作的提示。
+
+    目前命中规则：
+      - "Regex lookahead/lookbehind/backreferences not supported in JSON Schema pattern"
+        → 提示客户端 tool schema 含 RE2 不支持的正则；我们已经自动剥过一遍，
+          如果还报这个就说明在我们检测之外的位置（如 description 里嵌套 schema、
+          或 escape 形态我们没匹配），给出 hint。
+    """
+    if status != 400 or not msg:
+        return msg
+    low = msg.lower()
+    if (
+        "regex lookahead" in low
+        or "regex lookbehind" in low
+        or "lookahead (?=" in low
+        or "lookbehind (?<" in low
+        or "regex backreferences" in low
+        or "backreferences not supported" in low
+    ):
+        return (
+            f"{msg}\n\n[gateway hint] "
+            "Fireworks 上游 RE2 正则引擎不支持 lookahead/lookbehind/backreference。"
+            "网关已尝试自动剥除 tools[].input_schema.properties.*.pattern 中的此类正则，"
+            "但仍有未覆盖的位置 — 请检查你的工具 schema（含嵌套 oneOf/anyOf/items 等），"
+            "把含 (?=...)/(?!...)/(?<=...)/(?<!...)/\\N 的 pattern 简化或移除。"
+        )
+    return msg
+
+
 def _ensure_stream_usage(body: dict[str, Any]) -> dict[str, Any]:
     if not body.get("stream"):
         return body
@@ -357,6 +387,9 @@ async def forward(
             last_error_body,
             default_message=f"all upstream keys exhausted (last_status={last_error_status})",
         )
+
+        # 友好化已知的上游错误模式 — 客户端拿到的消息更可操作
+        upstream_msg = _friendlify_upstream_error(upstream_msg, last_error_status)
 
         # 客户端错误（400/422）直接透传上游响应；不要包装成"切换失败"
         if last_error_status in (400, 422):
