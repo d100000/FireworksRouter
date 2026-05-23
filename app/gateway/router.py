@@ -27,9 +27,72 @@ async def _parse_body(request: Request) -> dict[str, Any]:
         raw = await request.body()
         if not raw:
             return {}
-        return json.loads(raw)
+        body = json.loads(raw)
     except json.JSONDecodeError:
         raise APIError(400, "Invalid JSON body", "invalid_request_error") from None
+
+    # 客户端混搭兼容：自动清洗 Anthropic 专属字段 / 扁平化纯文本 content blocks
+    # 这样客户端即使带了 cache_control / cache_creation 等 Claude 字段，
+    # 或把 content 写成 [{type:'text', text:'...'}]，我们也能让上游 OpenAI 协议
+    # 顺利消化。已经标准的 OpenAI multimodal blocks（image_url 等）保留不动。
+    return _sanitize_openai_request(body)
+
+
+# Anthropic 专属字段（在 OpenAI 上游会报"Extra inputs are not permitted"）
+_ANTHROPIC_ONLY_BLOCK_FIELDS = {"cache_control", "cache_creation"}
+
+
+def _sanitize_openai_request(body: Any) -> Any:
+    """把客户端发来的 chat.completions 请求体清洗成 OpenAI 严格兼容形态。
+
+    主要处理：
+    1. messages[*].content 是 list of blocks 时：
+       - 剥掉块上的 cache_control / cache_creation（Anthropic 专属）
+       - 如果所有 block 都是 type=text，扁平化为 string（OpenAI 也接受 list 的 text，
+         但很多上游对纯文本 list 校验更严，扁平化最安全）
+       - 含 image_url 等 OpenAI multimodal block 时保留 list 结构
+    2. 顶层若残留 Anthropic 字段（如顶层 cache_control），剥除
+    """
+    if not isinstance(body, dict):
+        return body
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return body
+
+    cleaned: list = []
+    for m in messages:
+        if not isinstance(m, dict):
+            cleaned.append(m)
+            continue
+        # 剥消息层的 Anthropic 字段（如 m["cache_control"]）
+        m = {k: v for k, v in m.items() if k not in _ANTHROPIC_ONLY_BLOCK_FIELDS}
+        content = m.get("content")
+        if isinstance(content, list):
+            normalized_blocks: list = []
+            text_parts: list[str] = []
+            has_multimodal = False
+            for b in content:
+                if not isinstance(b, dict):
+                    text_parts.append(str(b))
+                    normalized_blocks.append(b)
+                    continue
+                # 剥 Anthropic 字段
+                clean_block = {k: v for k, v in b.items() if k not in _ANTHROPIC_ONLY_BLOCK_FIELDS}
+                btype = clean_block.get("type")
+                if btype == "text":
+                    text_parts.append(clean_block.get("text", "") or "")
+                else:
+                    has_multimodal = True
+                normalized_blocks.append(clean_block)
+            if not has_multimodal:
+                # 全是文本 — 扁平化为 string（最大兼容性）
+                m["content"] = "\n".join(s for s in text_parts if s)
+            else:
+                # 保留 multimodal blocks 结构（image_url 等）
+                m["content"] = normalized_blocks
+        cleaned.append(m)
+    body["messages"] = cleaned
+    return body
 
 
 def _enforce_acl(api_key, body: dict[str, Any]) -> None:
