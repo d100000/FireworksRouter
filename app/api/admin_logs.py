@@ -11,7 +11,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
@@ -270,3 +270,87 @@ async def cleanup_run_now() -> dict[str, Any]:
     """手动触发一次清理（按当前 settings 保留期），返回每张表删了多少行。"""
     deleted = await metrics_svc.run_cleanup_once()
     return {"deleted": deleted, "ran_at": datetime.now(timezone.utc).isoformat()}
+
+
+# --------------------------------------------------------------------------- #
+# schema 消毒统计：用 system_logs 的 category=schema_sanitize 标签
+# --------------------------------------------------------------------------- #
+
+
+@router.get("/stats/schema-sanitize")
+async def schema_sanitize_stats(
+    session: SessionDep,
+    hours: int = Query(24, ge=1, le=24 * 30, description="过去 N 小时"),
+) -> dict[str, Any]:
+    """统计过去 N 小时内 gateway 帮客户端修复了多少 schema 问题。
+
+    数据来源：system_logs 表里 extra 含 `"category":"schema_sanitize"` 的事件。
+    每个事件代表一次请求触发了消毒（一个请求里可能修了多个问题，extra.categories
+    里有细分计数）。
+
+    返回：
+      total_events      触发了消毒的请求数
+      total_items       被消毒的具体问题数（聚合所有事件的 categories）
+      by_category       按类型分组的计数
+                         {lookaround, atomic_group, comment, backref,
+                          possessive_quantifier, ref_inline, ref_circular,
+                          ref_dangling, pattern_properties_key, ...}
+      by_source         按来源分组（anthropic_tools / openai）
+      recent            最近 10 条事件预览（含 message + timestamp + categories）
+    """
+    import json as _json
+    from app.models import SystemLog
+    from sqlalchemy import select
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    # extra 是 TEXT，没法在 DB 端 JSON 解析（要兼容 SQLite + PG）— LIKE 预过滤
+    # 然后 Python 端聚合。消毒事件量本身不大（每次有问题请求 1 条 WARNING）。
+    stmt = (
+        select(SystemLog)
+        .where(SystemLog.timestamp >= cutoff)
+        .where(SystemLog.extra.like('%"category":%"schema_sanitize"%'))
+        .order_by(SystemLog.timestamp.desc())
+    )
+    rows = list((await session.execute(stmt)).scalars().all())
+
+    by_category: dict[str, int] = {}
+    by_source: dict[str, int] = {}
+    total_items = 0
+    recent: list[dict[str, Any]] = []
+
+    for r in rows:
+        extra_dict: dict[str, Any] = {}
+        if r.extra:
+            try:
+                extra_dict = _json.loads(r.extra)
+            except (_json.JSONDecodeError, ValueError):
+                continue
+        if extra_dict.get("category") != "schema_sanitize":
+            continue
+        cats = extra_dict.get("categories") or {}
+        if isinstance(cats, dict):
+            for cat, cnt in cats.items():
+                try:
+                    n = int(cnt)
+                except (TypeError, ValueError):
+                    n = 0
+                by_category[cat] = by_category.get(cat, 0) + n
+                total_items += n
+        src = extra_dict.get("source") or "unknown"
+        by_source[src] = by_source.get(src, 0) + 1
+        if len(recent) < 10:
+            recent.append({
+                "timestamp": r.timestamp.isoformat() if r.timestamp else None,
+                "source": src,
+                "categories": cats if isinstance(cats, dict) else {},
+                "message": (r.message or "")[:300],
+            })
+
+    return {
+        "hours": hours,
+        "total_events": len(rows),
+        "total_items": total_items,
+        "by_category": dict(sorted(by_category.items(), key=lambda kv: -kv[1])),
+        "by_source": by_source,
+        "recent": recent,
+    }

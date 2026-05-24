@@ -324,14 +324,16 @@ def _translate_assistant_message(content: Any) -> dict[str, Any]:
 def _translate_tools(tools: Any) -> list[dict[str, Any]]:
     """Anthropic tools → OpenAI tools（包装成 type=function）。
 
-    顺便对 input_schema 做 JSON Schema 消毒：
-      1. inline_refs：展开 $ref / $defs（Fireworks resolver 有 NoneType bug）
-      2. sanitize_patterns：剥 lookahead/lookbehind/backref（RE2 不支持）
-    详见 utils/json_schema.py。
+    顺便对 input_schema 做完整 JSON Schema 消毒（单次遍历）：
+      - 展开 $ref / $defs（Fireworks resolver NoneType bug）
+      - 剥 RE2 不支持的 pattern（lookaround / backref / atomic group /
+        possessive quantifier / inline comment）
+      - 处理循环引用 / 悬空引用
+    详见 utils/json_schema.py:sanitize_schema。
     """
     if not isinstance(tools, list):
         return []
-    from app.utils.json_schema import inline_refs, sanitize_patterns
+    from app.utils.json_schema import aggregate_categories, sanitize_schema
     from app.utils.logger import logger
 
     out: list[dict[str, Any]] = []
@@ -342,13 +344,8 @@ def _translate_tools(tools: Any) -> list[dict[str, Any]]:
         name = t.get("name")
         if not name:
             continue
-        params = t.get("input_schema") or {"type": "object", "properties": {}}
-        notes: list[str] = []
-        # 1. 先 inline $ref
-        params, ref_notes = inline_refs(params)
-        notes.extend(ref_notes)
-        # 2. 再剥不支持的 pattern
-        sanitize_patterns(params, notes)
+        raw_schema = t.get("input_schema") or {"type": "object", "properties": {}}
+        params, notes = sanitize_schema(raw_schema)
         if notes:
             notes_all.extend(f"tool[{name}] {n}" for n in notes)
         out.append({
@@ -360,7 +357,9 @@ def _translate_tools(tools: Any) -> list[dict[str, Any]]:
             },
         })
     if notes_all:
-        logger.warning(
+        # 加 category 维度 + bind 给 metrics 聚合用
+        cats = aggregate_categories(notes_all)
+        logger.bind(category="schema_sanitize", source="anthropic_tools", categories=cats).warning(
             "anthropic tools: schema sanitized {} item(s) — first 3: {}",
             len(notes_all), notes_all[:3],
         )

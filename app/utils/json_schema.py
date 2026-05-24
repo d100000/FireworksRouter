@@ -1,28 +1,24 @@
-"""JSON Schema 消毒：剥掉 Fireworks 上游 RE2 引擎不支持的正则特性。
+"""JSON Schema 消毒：把上游不能消化的 schema 特性提前清洗掉。
 
-背景
-====
-Fireworks 的 tool calling 校验器（多半基于 Go `regexp` / RE2）为了线性时间复杂度，
-不支持以下 PCRE 特性：
+Fireworks（以及大多数 RE2 系 / Go regexp）和 Anthropic / OpenAI 客户端常用的
+PCRE 引擎能力不同，导致下面这些客户端合法的 schema 在上游会爆：
 
-  - lookaround:   (?=...) (?!...) (?<=...) (?<!...)
-  - backreference: \\1 \\2 … \\9
+  - lookaround:        (?=)  (?!)  (?<=)  (?<!)
+  - backreference:     \\1 .. \\9
+  - atomic group:      (?>...)
+  - possessive qty:    *+  ++  ?+
+  - inline comment:    (?#...)
 
-而 Anthropic / OpenAI 客户端常用 PCRE 引擎，工具 schema 里塞这种正则很常见
-（典型例子：DNS hostname 校验用 `(?=.{1,253}$)` 限定总长）。
+另外 Fireworks 的 `$ref` resolver 在解析 `#/$defs/...` 时会出 NoneType.lookup
+的服务端 bug（resolver 没拿到 definitions 表），所以本模块也负责把所有 local
+`$ref` 提前 inline 展开。
 
-我们的 gateway 之前原样转发 `tools[].function.parameters`，结果上游 400：
-    "Regex lookahead (?=...) is not supported in JSON Schema pattern: '...'"
-
-策略
-====
-对所有进入网关的工具 schema，递归扫所有嵌套的 `pattern` 字段；只要发现不兼容
-特性就**丢掉这个 pattern**（schema 其余约束保留），并把丢掉的列表返回供日志。
-这样请求能走通；LLM 输出的工具参数失去额外正则校验，但 description 仍能引导
-模型输出合理值，而且客户端拿到结果后无论如何都该自己再 validate。
-
-故意保守的设计：宁可漏检（保留一些上游 OK 的 pattern）也不要误杀（剥掉
-上游能消化的）。所以我们只匹配明确无支持的 token。
+设计原则
+========
+* 单次递归遍历同时处理 `$ref` 展开和 `pattern` 检查 — 大 schema 不走两遍
+* 输出新对象（不破坏原 schema，方便上层 retry / fallback）
+* 遇到无法处理的（外部 ref、复杂自引用）保守保留，宁可漏检不要误杀
+* notes 带 category 信息，便于 metrics 聚合分类
 """
 
 from __future__ import annotations
@@ -30,153 +26,58 @@ from __future__ import annotations
 import re
 from typing import Any
 
-# RE2 / Go regexp 不支持的语法 token（substring 匹配即可，这些转义在普通 pattern
-# 里几乎不可能"恰好"组合出来，误判概率极低）。
-_UNSUPPORTED_LOOKAROUND_TOKENS = ("(?=", "(?!", "(?<=", "(?<!")
+# --------------------------------------------------------------------------- #
+# 不支持的正则特性检测
+# --------------------------------------------------------------------------- #
 
-# 反向引用 \1 .. \9 — 不在字符类内部时才算反向引用，但字符类里出现 \\N 本身就
-# 是 Python regex 中的非法语法（必须用 [0-9]），所以这里粗匹配也行。
+# Substring 匹配即可 — 这些 token 在普通 pattern 里几乎不可能"恰好"组合出来
+# （需要的 escape 都被 `\` 前缀阻断），误判率极低。
+_UNSUPPORTED_TOKENS: dict[str, tuple[str, str]] = {
+    # token : (category, human_reason)
+    "(?=":  ("lookaround", "lookahead '(?='"),
+    "(?!":  ("lookaround", "negative lookahead '(?!'"),
+    "(?<=": ("lookaround", "lookbehind '(?<='"),
+    "(?<!": ("lookaround", "negative lookbehind '(?<!'"),
+    "(?>":  ("atomic_group", "atomic group '(?>'"),
+    "(?#":  ("comment", "inline comment '(?#'"),
+}
+
+# \1 .. \9 反向引用 — 在字符类 [...] 里它本身就是非法语法（必须写 [0-9]），
+# 所以粗粒度匹配安全。
 _BACKREF_RE = re.compile(r"\\[1-9]")
 
+# 占有量词：*+ ++ ?+。技术上 {n,m}+ 也是，但极少见，忽略以避免和 {n,m} 的
+# 普通 quantifier 重叠 false-positive。
+_POSSESSIVE_QUANTIFIER_RE = re.compile(r"[*+?]\+")
 
-def detect_unsupported_regex(pattern: Any) -> str | None:
+
+def detect_unsupported_regex(pattern: Any) -> tuple[str, str] | None:
     """检查 pattern 是否含 RE2 不支持的特性。
 
-    返回原因字符串（如 "lookaround '(?='"）；None 表示安全。
+    返回 (category, reason) 元组；None 表示安全。
+    category 用于 metrics 聚合（lookaround / atomic_group / comment / backref /
+    possessive_quantifier）。
     """
     if not isinstance(pattern, str) or not pattern:
         return None
-    for tok in _UNSUPPORTED_LOOKAROUND_TOKENS:
+    for tok, (cat, reason) in _UNSUPPORTED_TOKENS.items():
         if tok in pattern:
-            return f"lookaround '{tok}'"
+            return cat, reason
     if _BACKREF_RE.search(pattern):
-        return r"backreference '\N'"
+        return "backref", r"backreference '\N'"
+    if _POSSESSIVE_QUANTIFIER_RE.search(pattern):
+        return "possessive_quantifier", "possessive quantifier '*+/++/?+'"
     return None
-
-
-def sanitize_patterns(schema: Any, stripped: list[str] | None = None) -> list[str]:
-    """**原地**递归走 JSON Schema，丢掉所有不兼容的 `pattern` 字段。
-
-    Args:
-        schema: dict | list | scalar — 通常是 JSON Schema 根 (dict)。
-        stripped: 收集被剥掉的描述信息，便于上层日志。None 表示新建一个内部 list。
-
-    Returns:
-        被剥掉的描述列表（同 stripped 参数；用 return 是为了让调用方一行拿到）。
-    """
-    if stripped is None:
-        stripped = []
-    _walk(schema, stripped)
-    return stripped
-
-
-def _walk(node: Any, stripped: list[str]) -> None:
-    if isinstance(node, dict):
-        # 优先处理本节点 pattern（在 properties.X 这层、items 这层等都可能出现）
-        p = node.get("pattern")
-        if p is not None:
-            reason = detect_unsupported_regex(p)
-            if reason:
-                preview = str(p)[:120]
-                stripped.append(f"{reason}: {preview}")
-                node.pop("pattern", None)
-        # patternProperties 的 key 本身就是 regex，也可能 lookaround
-        pp = node.get("patternProperties")
-        if isinstance(pp, dict):
-            bad_keys = [k for k in pp if detect_unsupported_regex(k)]
-            for k in bad_keys:
-                stripped.append(f"patternProperties key '{k[:80]}'")
-                # 整个 entry 删掉（key 不能改，schema 语义就丢了）
-                pp.pop(k, None)
-            if not pp:
-                node.pop("patternProperties", None)
-        # 递归所有值
-        for v in node.values():
-            _walk(v, stripped)
-    elif isinstance(node, list):
-        for item in node:
-            _walk(item, stripped)
 
 
 # --------------------------------------------------------------------------- #
 # $ref / $defs inline 解析
 # --------------------------------------------------------------------------- #
 #
-# 背景：Fireworks 服务端 schema resolver 解析 `$ref: '#/$defs/Name'` 时容易出
-# `AttributeError("'NoneType' object has no attribute 'lookup'")` —— 它把 tool
-# parameters 单独取出来时丢了 $defs 表，或只认 draft-07 的 `definitions` 不认
-# 2019-09+ 的 `$defs`。网关层把所有 $ref 提前展开，上游就看到扁平 schema，
-# 用不上它有问题的 resolver。
-#
-# 处理边界：
-#   - 只解析 local pointer `#/$defs/X` 和 `#/definitions/X`
-#   - 外部 ref（http://... 或非 # 开头）保留不动
-#   - 循环引用（A→B→A）降级为 {}，避免无限展开
-#   - 悬空引用（target 不存在）降级为 {}，免得上游同样的 resolver bug 复现
-#   - $ref 同级的兄弟字段保留（modern spec 允许，旧版按 $ref 单独子句处理）
+# 单次递归同时处理 $ref 展开 + pattern 消毒，避免两遍 walk 浪费 CPU。
+# 返回 (new_schema, notes)，notes 每项形如 "category: detail" 便于解析归类。
 
 _LOCAL_REF_PREFIXES = ("#/$defs/", "#/definitions/")
-
-
-def inline_refs(schema: Any) -> tuple[Any, list[str]]:
-    """把 schema 中所有 local `$ref` 内联展开。
-
-    Args:
-        schema: dict — JSON Schema 根（通常是 `tools[].function.parameters`）
-
-    Returns:
-        (new_schema, notes) — new_schema 是新对象（不修改入参），notes 收集
-        循环/悬空/无法解析的 ref 描述，给调用方打日志。
-    """
-    notes: list[str] = []
-    if not isinstance(schema, dict):
-        return schema, notes
-
-    # 收集 definitions 表（$defs + 老 definitions 合并；$defs 优先）
-    defs = {}
-    raw_defs = schema.get("definitions")
-    if isinstance(raw_defs, dict):
-        defs.update(raw_defs)
-    raw_new_defs = schema.get("$defs")
-    if isinstance(raw_new_defs, dict):
-        defs.update(raw_new_defs)
-
-    # 没 ref 也没 defs 就直接返回（深拷贝避免上层 in-place 改）
-    # 但还是要走一遍 _resolve 以防 $defs 内部嵌 ref；快速通道只在两个表都空时跳过
-    if not defs and not _contains_ref(schema):
-        return schema, notes
-
-    def _resolve(node: Any, stack: tuple[str, ...]) -> Any:
-        if isinstance(node, dict):
-            ref = node.get("$ref")
-            if isinstance(ref, str):
-                target_name = _local_ref_name(ref)
-                if target_name is None:
-                    # 外部 ref / 不支持格式 — 原样保留
-                    return {k: _resolve(v, stack) for k, v in node.items()}
-                if target_name in stack:
-                    notes.append(f"circular ref '#/$defs/{target_name}' → empty")
-                    siblings = {k: _resolve(v, stack) for k, v in node.items() if k != "$ref"}
-                    return siblings or {}
-                target = defs.get(target_name)
-                if target is None:
-                    notes.append(f"dangling ref '{ref}' → empty")
-                    siblings = {k: _resolve(v, stack) for k, v in node.items() if k != "$ref"}
-                    return siblings or {}
-                # 递归展开目标（带 cycle 检测）
-                resolved = _resolve(target, stack + (target_name,))
-                if not isinstance(resolved, dict):
-                    return resolved
-                # 同级兄弟字段优先级覆盖 ref 解析出来的（按 JSON Schema 2019+ 语义）
-                siblings = {k: _resolve(v, stack) for k, v in node.items() if k != "$ref"}
-                return {**resolved, **siblings}
-            return {k: _resolve(v, stack) for k, v in node.items() if k not in ("$defs", "definitions")}
-        if isinstance(node, list):
-            return [_resolve(item, stack) for item in node]
-        return node
-
-    new_schema = _resolve(schema, stack=())
-    return new_schema, notes
 
 
 def _local_ref_name(ref: str) -> str | None:
@@ -186,59 +87,261 @@ def _local_ref_name(ref: str) -> str | None:
     return None
 
 
-def _contains_ref(node: Any) -> bool:
-    """快速预扫：node 子树是否含 $ref。避免没 ref 时还跑递归。"""
+def _contains_anything_to_sanitize(node: Any) -> bool:
+    """快速预扫：node 子树是否有任何需要处理的东西（$ref / pattern / $defs）。
+
+    没有就走 fast-path 直接返回原对象，避免递归构造新 dict。
+    """
     if isinstance(node, dict):
-        if "$ref" in node:
+        if "$ref" in node or "$defs" in node or "definitions" in node:
             return True
-        return any(_contains_ref(v) for v in node.values())
+        if "pattern" in node or "patternProperties" in node:
+            return True
+        return any(_contains_anything_to_sanitize(v) for v in node.values())
     if isinstance(node, list):
-        return any(_contains_ref(item) for item in node)
+        return any(_contains_anything_to_sanitize(item) for item in node)
     return False
 
 
+def sanitize_schema(schema: Any) -> tuple[Any, list[str]]:
+    """**核心 API**：对一个 JSON Schema 做完整消毒。
+
+    单次递归同时：
+      1. 展开所有 local `$ref`（#/$defs/X 和 #/definitions/X）
+      2. 剥掉 RE2 不支持的 `pattern` 字段
+      3. 清理 `patternProperties` 中 key 含不支持特性的 entry
+      4. 处理循环引用（降级 {}）和悬空引用（降级 {}）
+
+    输入：通常是 `tools[].function.parameters` 或 `response_format.json_schema.schema`
+    输出：(new_schema, notes)。new_schema 是新对象（不修改入参）。
+
+    notes 每项形如 `"ref_inline: SelectedScreenInstance"` /
+    `"lookaround: lookahead '(?='"` / `"ref_circular: A"` 等，
+    第一段是 category（给 metrics 聚合用），冒号后是详情。
+    """
+    notes: list[str] = []
+    if not isinstance(schema, dict):
+        return schema, notes
+    if not _contains_anything_to_sanitize(schema):
+        return schema, notes
+
+    # 收集顶层 $defs / definitions 表
+    defs: dict[str, Any] = {}
+    raw_defs = schema.get("definitions")
+    if isinstance(raw_defs, dict):
+        defs.update(raw_defs)
+    raw_new_defs = schema.get("$defs")
+    if isinstance(raw_new_defs, dict):
+        defs.update(raw_new_defs)
+
+    new_schema = _walk(schema, defs, notes, stack=())
+    return new_schema, notes
+
+
+def _walk(node: Any, defs: dict, notes: list[str], stack: tuple[str, ...]) -> Any:
+    if isinstance(node, dict):
+        # 1) $ref 展开
+        ref = node.get("$ref")
+        if isinstance(ref, str):
+            target_name = _local_ref_name(ref)
+            if target_name is None:
+                # 外部 ref / 不支持格式 — 原样保留，但递归其它字段
+                return {k: _walk(v, defs, notes, stack)
+                        for k, v in node.items() if k not in ("$defs", "definitions")}
+            if target_name in stack:
+                notes.append(f"ref_circular: {target_name}")
+                siblings = {k: _walk(v, defs, notes, stack)
+                            for k, v in node.items()
+                            if k not in ("$ref", "$defs", "definitions")}
+                return siblings or {}
+            target = defs.get(target_name)
+            if target is None:
+                notes.append(f"ref_dangling: {ref}")
+                siblings = {k: _walk(v, defs, notes, stack)
+                            for k, v in node.items()
+                            if k not in ("$ref", "$defs", "definitions")}
+                return siblings or {}
+            # 成功展开
+            notes.append(f"ref_inline: {target_name}")
+            resolved = _walk(target, defs, notes, stack + (target_name,))
+            siblings = {k: _walk(v, defs, notes, stack)
+                        for k, v in node.items()
+                        if k not in ("$ref", "$defs", "definitions")}
+            if isinstance(resolved, dict):
+                return {**resolved, **siblings}
+            return resolved
+
+        # 2) 普通字典节点：构造新 dict，过滤 $defs/definitions，处理 pattern / patternProperties
+        out: dict[str, Any] = {}
+        for k, v in node.items():
+            if k in ("$defs", "definitions"):
+                continue  # 顶层和嵌套 $defs 都干掉
+            if k == "pattern" and isinstance(v, str):
+                detection = detect_unsupported_regex(v)
+                if detection is not None:
+                    cat, reason = detection
+                    preview = v[:120]
+                    notes.append(f"{cat}: {reason} — {preview}")
+                    continue  # 跳过这个 pattern，相当于丢字段
+            if k == "patternProperties" and isinstance(v, dict):
+                cleaned_pp: dict[str, Any] = {}
+                for pp_key, pp_val in v.items():
+                    if isinstance(pp_key, str) and detect_unsupported_regex(pp_key):
+                        notes.append(f"pattern_properties_key: '{pp_key[:80]}'")
+                        continue
+                    cleaned_pp[pp_key] = _walk(pp_val, defs, notes, stack)
+                if cleaned_pp:
+                    out[k] = cleaned_pp
+                continue
+            out[k] = _walk(v, defs, notes, stack)
+        return out
+    if isinstance(node, list):
+        return [_walk(item, defs, notes, stack) for item in node]
+    return node
+
+
+# --------------------------------------------------------------------------- #
+# 兼容性 API：保留旧函数名（外部测试 / 老代码可能直接调）
+# --------------------------------------------------------------------------- #
+
+
+def inline_refs(schema: Any) -> tuple[Any, list[str]]:
+    """旧 API — 现在转调 sanitize_schema。
+
+    历史上 inline_refs 只做 ref 展开不做 pattern 消毒；现在统一到 sanitize_schema
+    一次性都做。如果你只想要 ref 展开行为，请直接用 sanitize_schema。
+    """
+    return sanitize_schema(schema)
+
+
+def sanitize_patterns(schema: Any, stripped: list[str] | None = None) -> list[str]:
+    """旧 API — 原地剥 unsupported pattern。保留供向后兼容。
+
+    新代码请用 sanitize_schema（返回新对象更安全 + 同时处理 $ref）。
+    """
+    if stripped is None:
+        stripped = []
+    if not isinstance(schema, dict) and not isinstance(schema, list):
+        return stripped
+    _strip_patterns_inplace(schema, stripped)
+    return stripped
+
+
+def _strip_patterns_inplace(node: Any, notes: list[str]) -> None:
+    if isinstance(node, dict):
+        p = node.get("pattern")
+        if isinstance(p, str):
+            det = detect_unsupported_regex(p)
+            if det is not None:
+                cat, reason = det
+                notes.append(f"{cat}: {reason} — {p[:120]}")
+                node.pop("pattern", None)
+        pp = node.get("patternProperties")
+        if isinstance(pp, dict):
+            bad = [k for k in pp if isinstance(k, str) and detect_unsupported_regex(k)]
+            for k in bad:
+                notes.append(f"pattern_properties_key: '{k[:80]}'")
+                pp.pop(k, None)
+            if not pp:
+                node.pop("patternProperties", None)
+        for v in node.values():
+            _strip_patterns_inplace(v, notes)
+    elif isinstance(node, list):
+        for item in node:
+            _strip_patterns_inplace(item, notes)
+
+
+# --------------------------------------------------------------------------- #
+# 高层接入点
+# --------------------------------------------------------------------------- #
+
+
 def sanitize_openai_tools(tools: Any) -> tuple[Any, list[str]]:
-    """走 OpenAI `tools` 数组 → 每个 `function.parameters` 跑 schema 消毒。
+    """OpenAI tools 数组消毒：每个 function.parameters 跑一遍 sanitize_schema。
 
-    消毒包括：
-      1. inline_refs：展开 $ref / $defs（Fireworks resolver bug 兜底）
-      2. sanitize_patterns：剥 lookahead/lookbehind/backref（RE2 不支持）
-
-    返回 (tools, notes)。tools 是原对象（in-place 替换 parameters）。
+    返回 (tools, notes)。tools 是原对象（替换 parameters 字段）。
     """
     notes: list[str] = []
     if not isinstance(tools, list):
         return tools, notes
 
-    def _process_params_holder(holder: dict, key: str) -> None:
+    def _process(holder: dict, key: str) -> None:
         params = holder.get(key)
         if not isinstance(params, dict):
             return
-        # 1. 先 inline ref（先后顺序：ref 展开 → pattern 消毒）
-        new_params, ref_notes = inline_refs(params)
-        if ref_notes:
-            notes.extend(ref_notes)
+        new_params, sub_notes = sanitize_schema(params)
+        if sub_notes:
+            notes.extend(sub_notes)
         if new_params is not params:
             holder[key] = new_params
-            params = new_params
-        # 2. 再扫 pattern
-        sanitize_patterns(params, notes)
 
     for t in tools:
         if not isinstance(t, dict):
             continue
         fn = t.get("function")
         if isinstance(fn, dict):
-            _process_params_holder(fn, "parameters")
-        # OpenAI 旧版 function schema（顶层 `function` 旁的 `parameters`）也兼容
-        if "parameters" in t and not isinstance(t.get("function"), dict):
-            _process_params_holder(t, "parameters")
+            _process(fn, "parameters")
+        elif "parameters" in t:
+            # 老版 OpenAI function schema
+            _process(t, "parameters")
     return tools, notes
+
+
+def sanitize_response_format(body: dict) -> list[str]:
+    """OpenAI structured outputs：消毒 `response_format.json_schema.schema`。
+
+    形态：
+      {"response_format": {"type": "json_schema", "json_schema": {"schema": {...}}}}
+
+    或 Anthropic 客户端发到 OpenAI 路径的偶发别名（少见，保险起见也处理）。
+
+    返回 notes（in-place 替换 schema 字段）。
+    """
+    notes: list[str] = []
+    if not isinstance(body, dict):
+        return notes
+    rf = body.get("response_format")
+    if not isinstance(rf, dict):
+        return notes
+    js = rf.get("json_schema")
+    if not isinstance(js, dict):
+        return notes
+    schema = js.get("schema")
+    if not isinstance(schema, dict):
+        return notes
+    new_schema, sub_notes = sanitize_schema(schema)
+    if sub_notes:
+        notes.extend(sub_notes)
+    if new_schema is not schema:
+        js["schema"] = new_schema
+    return notes
+
+
+# --------------------------------------------------------------------------- #
+# Notes → metrics category 聚合
+# --------------------------------------------------------------------------- #
+
+
+def aggregate_categories(notes: list[str]) -> dict[str, int]:
+    """把 sanitize_* 函数返回的 notes 列表按 category 聚合成计数器。
+
+    格式：'category: detail' → {category: count}
+    用于日志 extra 字段 + admin stats 端点 + Dashboard 展示。
+    """
+    counts: dict[str, int] = {}
+    for n in notes:
+        cat = n.split(":", 1)[0].strip() if ":" in n else "other"
+        counts[cat] = counts.get(cat, 0) + 1
+    return counts
 
 
 __all__ = [
     "detect_unsupported_regex",
-    "sanitize_patterns",
-    "inline_refs",
+    "sanitize_schema",
     "sanitize_openai_tools",
+    "sanitize_response_format",
+    "aggregate_categories",
+    # 兼容旧 API
+    "inline_refs",
+    "sanitize_patterns",
 ]

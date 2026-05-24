@@ -93,18 +93,30 @@ def _sanitize_openai_request(body: Any) -> Any:
         cleaned.append(m)
     body["messages"] = cleaned
 
-    # tools 里的 JSON Schema pattern 消毒（剥 lookahead/lookbehind/backref）
-    # 上游 Fireworks 用 RE2 不支持这些；客户端发了网关就帮忙剥，不要让请求白白挂掉
+    # JSON Schema 消毒（一次性把 tools 和 response_format 都处理）
+    # 上游 Fireworks 用 RE2 + $ref resolver 有 bug；客户端发了网关就帮忙清洗
+    from app.utils.json_schema import (
+        aggregate_categories, sanitize_openai_tools, sanitize_response_format,
+    )
+    from app.utils.logger import logger
+
+    all_notes: list[str] = []
+
     tools = body.get("tools")
     if isinstance(tools, list):
-        from app.utils.json_schema import sanitize_openai_tools
-        from app.utils.logger import logger
-        _, stripped = sanitize_openai_tools(tools)
-        if stripped:
-            logger.warning(
-                "openai tools: stripped {} unsupported regex pattern(s) — first 3: {}",
-                len(stripped), stripped[:3],
-            )
+        _, notes = sanitize_openai_tools(tools)
+        all_notes.extend(f"tools {n}" for n in notes)
+
+    # response_format.json_schema.schema 同样消毒（structured outputs）
+    rf_notes = sanitize_response_format(body)
+    all_notes.extend(f"response_format {n}" for n in rf_notes)
+
+    if all_notes:
+        cats = aggregate_categories(all_notes)
+        logger.bind(category="schema_sanitize", source="openai", categories=cats).warning(
+            "openai request: schema sanitized {} item(s) — first 3: {}",
+            len(all_notes), all_notes[:3],
+        )
 
     return body
 
