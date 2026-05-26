@@ -12,7 +12,7 @@ from app.api.deps import APIError, ApiKeyDep, SessionDep
 from app.config import get_settings
 from app.crypto import decrypt_key
 from app.db import session_scope
-from app.gateway.proxy import forward
+from app.gateway.proxy import forward, get_shared_client
 from app.models import Model, ModelStatus
 from app.services import models as models_svc
 from app.services import scheduler
@@ -269,11 +269,11 @@ async def _proxy_multipart(request: Request, api_key, endpoint_path: str):
         if k.lower() not in {"host", "authorization", "content-length", "accept-encoding"}
     }
     headers["Authorization"] = f"Bearer {plain}"
-    async with httpx.AsyncClient(
+    client = get_shared_client()
+    resp = await client.post(
+        upstream_url, headers=headers, content=body_bytes,
         timeout=httpx.Timeout(_settings.gateway_default_timeout_s, connect=10.0),
-        proxy=_settings.proxy_url,
-    ) as client:
-        resp = await client.post(upstream_url, headers=headers, content=body_bytes)
+    )
     out_headers = {
         k: v for k, v in resp.headers.items()
         if k.lower() not in {"content-length", "content-encoding", "transfer-encoding", "connection", "server", "date"}

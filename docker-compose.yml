@@ -6,7 +6,7 @@
 # 备份：  bash scripts/backup.sh
 #
 # 服务：
-#   - api        FastAPI + Gunicorn × 4 worker，含 alembic 自动迁移、前端 SPA
+#   - api        FastAPI + Gunicorn × 24 worker，含 alembic 自动迁移、前端 SPA
 #   - postgres   主数据库 (15-alpine)
 #   - redis      可选，目前未强依赖
 #   - caddy      （可选 profile=https）反向代理 + 自动 HTTPS

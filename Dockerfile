@@ -60,15 +60,16 @@ EXPOSE 8011
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD curl -fsS http://127.0.0.1:8011/healthz || exit 1
 
-# Gunicorn + Uvicorn worker × 4
+# Gunicorn + Uvicorn worker
+# 参数通过环境变量可覆盖，默认值针对 8C16G IO 密集型场景调优
 CMD ["gunicorn", \
      "-k", "uvicorn.workers.UvicornWorker", \
-     "-w", "4", \
+     "-w", "24", \
      "-b", "0.0.0.0:8011", \
      "--access-logfile", "-", \
      "--error-logfile", "-", \
-     "--timeout", "180", \
-     "--graceful-timeout", "30", \
-     "--max-requests", "5000", \
-     "--max-requests-jitter", "500", \
+     "--timeout", "300", \
+     "--graceful-timeout", "120", \
+     "--max-requests", "50000", \
+     "--max-requests-jitter", "5000", \
      "app.main:app"]

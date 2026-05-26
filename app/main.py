@@ -18,6 +18,7 @@ from app.config import get_settings
 from app.db import init_db
 from app.gateway import anthropic as anthropic_router
 from app.gateway import router as gateway_router
+from app.gateway.proxy import close_shared_client, init_shared_client
 from app.services import metrics as metrics_svc
 from app.tasks.scheduler import start_scheduler, stop_scheduler
 from app.utils.logger import logger, setup_logging, start_db_sink, stop_db_sink
@@ -39,6 +40,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         await _pc.seed_initial(_s)
     sched = start_scheduler()
     metrics_svc.start_workers()
+    init_shared_client()
     # 启动 DB sink worker（之前 setup_logging 已注册 sink，但 worker 未起，
     # 早期 INFO/WARNING 会沉默丢弃；从这里起入 DB）
     await start_db_sink()
@@ -56,6 +58,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        await close_shared_client()
         metrics_svc.stop_workers()
         stop_scheduler()
         _ = sched

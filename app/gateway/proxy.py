@@ -24,6 +24,40 @@ from app.utils.logger import logger
 
 settings = get_settings()
 
+# ---------------------------------------------------------------------------
+# 共享 httpx 连接池（进程级单例）
+# 每个 Gunicorn worker 是独立进程，各自持有一个 AsyncClient 实例，
+# 内部维护 keep-alive 连接池，避免每请求都新建 TCP 连接。
+# ---------------------------------------------------------------------------
+_shared_client: httpx.AsyncClient | None = None
+
+
+def get_shared_client() -> httpx.AsyncClient:
+    """获取当前 worker 的共享 httpx client。由 lifespan 负责初始化和关闭。"""
+    if _shared_client is None:
+        raise RuntimeError("shared httpx client not initialized — lifespan not started?")
+    return _shared_client
+
+
+def init_shared_client() -> None:
+    global _shared_client
+    _shared_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(float(settings.gateway_default_timeout_s), connect=10.0),
+        proxy=settings.proxy_url,
+        limits=httpx.Limits(
+            max_keepalive_connections=100,
+            max_connections=300,
+            keepalive_expiry=30,
+        ),
+    )
+
+
+async def close_shared_client() -> None:
+    global _shared_client
+    if _shared_client is not None:
+        await _shared_client.aclose()
+        _shared_client = None
+
 
 @dataclass
 class GatewayUsage:
@@ -258,23 +292,20 @@ async def _try_single(
     request_body: bytes,
     timeout: float,
     is_stream: bool,
-) -> tuple[httpx.Response, httpx.AsyncClient] | None:
-    # 注：每请求新建 client 是为了让 stream 生命周期跟着请求走（流式时 client 必须
-    # 等到上游响应完成才能关）。如果需要更高吞吐，可以引入一个全局 connection pool
-    # （httpx.AsyncClient 内部已经做了 keep-alive；只要进程级别复用 transport 就行）。
-    client = httpx.AsyncClient(
-        timeout=httpx.Timeout(timeout, connect=10.0),
-        proxy=settings.proxy_url,
-        limits=httpx.Limits(max_keepalive_connections=50, max_connections=200),
-    )
+) -> httpx.Response | None:
+    """使用共享连接池发起单次上游请求。
+
+    流式响应安全：httpx 的 stream 模式下，连接在 response.aclose() 时归还池，
+    不需要关闭整个 client。
+    """
+    client = get_shared_client()
     try:
         req = client.build_request(
             "POST", upstream_url, headers=request_headers, content=request_body
         )
-        resp = await client.send(req, stream=is_stream)
-        return resp, client
+        resp = await client.send(req, stream=is_stream, timeout=timeout)
+        return resp
     except Exception as e:  # noqa: BLE001
-        await client.aclose()
         logger.warning("[{}] upstream connection error: {}", request_id, e)
         return None
 
@@ -316,7 +347,6 @@ async def forward(
     last_error_body: str | None = None
     chosen_key: UpstreamKey | None = None
     upstream_response: httpx.Response | None = None
-    upstream_client: httpx.AsyncClient | None = None
 
     max_attempts = max(1, min(settings.gateway_max_retry, settings.gateway_max_retry_credentials))
 
@@ -361,12 +391,11 @@ async def forward(
                 continue
             break
 
-        resp, client = attempt_result
+        resp = attempt_result
 
         # 成功
         if 200 <= resp.status_code < 400:
             upstream_response = resp
-            upstream_client = client
             await cooldown.apply_success(upstream_id, model_id)
             break
 
@@ -377,7 +406,6 @@ async def forward(
             last_error_body = None
         last_error_status = resp.status_code
         await resp.aclose()
-        await client.aclose()
 
         decision = await cooldown.apply_error(
             upstream_id, model_id,
@@ -395,7 +423,7 @@ async def forward(
         if not decision.retryable:
             break
 
-    if upstream_response is None or upstream_client is None:
+    if upstream_response is None:
         # 全部失败：按错误类型映射成对应的 OpenAI 错误
         upstream_msg = gw_errors.parse_upstream_error(
             last_error_body,
@@ -451,7 +479,6 @@ async def forward(
             body_bytes = await upstream_response.aread()
         finally:
             await upstream_response.aclose()
-            await upstream_client.aclose()
 
         usage = GatewayUsage()
         try:
@@ -520,10 +547,6 @@ async def forward(
         finally:
             try:
                 await upstream_response.aclose()
-            except Exception:  # noqa: BLE001
-                pass
-            try:
-                await upstream_client.aclose()
             except Exception:  # noqa: BLE001
                 pass
             await _persist_log(
