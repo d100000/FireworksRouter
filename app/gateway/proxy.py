@@ -301,9 +301,10 @@ async def _try_single(
     client = get_shared_client()
     try:
         req = client.build_request(
-            "POST", upstream_url, headers=request_headers, content=request_body
+            "POST", upstream_url, headers=request_headers, content=request_body,
+            timeout=httpx.Timeout(timeout, connect=10.0),
         )
-        resp = await client.send(req, stream=is_stream, timeout=timeout)
+        resp = await client.send(req, stream=is_stream)
         return resp
     except Exception as e:  # noqa: BLE001
         logger.warning("[{}] upstream connection error: {}", request_id, e)
