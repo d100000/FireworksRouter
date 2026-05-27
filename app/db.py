@@ -22,7 +22,7 @@ _settings = get_settings()
 
 _engine_kwargs: dict = {"echo": False}
 if not _settings.is_sqlite:
-    # 连接池调优（Gunicorn 24 workers，PG max_connections=300）：
+    # 连接池调优（Gunicorn 24 workers，PG max_connections=500）：
     #
     # 本服务是 IO 密集型代理，DB 操作极轻（查 key ~2ms → 转发等上游 → 写日志 ~3ms）。
     # 每请求同一时刻只占 1 个连接，长时间等上游期间不持连接。
