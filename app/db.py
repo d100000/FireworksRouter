@@ -22,14 +22,13 @@ _settings = get_settings()
 
 _engine_kwargs: dict = {"echo": False}
 if not _settings.is_sqlite:
-    # 连接池调优（Gunicorn 24 workers 场景）：
-    #   每 worker: pool_size=8 + max_overflow=4 = 上限 12
-    #   24 workers × 12 = 288，低于 PG max_connections=500
-    #   剩余 200+ 给 psql、监控、探针等
+    # 连接池调优（Gunicorn 24 workers，PG max_connections=1000）：
+    #   每 worker: pool_size=20 + max_overflow=20 = 上限 40
+    #   24 workers × 40 = 960，留 40 给 psql/监控
     _engine_kwargs.update(
         pool_pre_ping=True,
-        pool_size=8,
-        max_overflow=4,
+        pool_size=20,
+        max_overflow=20,
         pool_recycle=1800,
         pool_timeout=30,
     )

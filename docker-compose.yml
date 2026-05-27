@@ -39,8 +39,8 @@ services:
         -c shared_buffers=256MB
         -c effective_cache_size=1GB
         -c maintenance_work_mem=64MB
-        -c work_mem=8MB
-        -c max_connections=500
+        -c work_mem=4MB
+        -c max_connections=1000
         -c wal_compression=on
         -c synchronous_commit=on
         -c checkpoint_completion_target=0.9
