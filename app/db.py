@@ -22,22 +22,16 @@ _settings = get_settings()
 
 _engine_kwargs: dict = {"echo": False}
 if not _settings.is_sqlite:
-    # 连接池调优：
-    #   pool_size=10            常驻 10 个 — 满足正常 API 流量
-    #   max_overflow=20         峰值时再开 20 个临时连接（如全量探针 / 批量导入）
-    #                           总上限 = 30，给 PG 默认 max_connections=100 留出 70 个
-    #                           给其它客户端（监控、psql、CI 工具）。
+    # 连接池调优（Gunicorn 24 workers 场景）：
+    #   每 worker: pool_size=5 + max_overflow=3 = 上限 8
+    #   24 workers × 8 = 192，低于 PG max_connections=200
     #   pool_pre_ping=True      取连接时 ping 一下，避免拿到 stale conn
-    #   pool_recycle=1800       连接活到 30 分钟强制回收 — 防止 PG 服务端断 idle 连接
-    #                           （PG idle_session_timeout / 防火墙 NAT 超时 etc.）
-    #   pool_timeout=30         拿不到连接最多等 30s 就抛 TimeoutError —— 不要无限挂死
-    #
-    # 历史 bug：之前 pool_size=20 + max_overflow=40 = 上限 60，再叠加 probe HTTP
-    # 长时间占用连接的 bug，单波探针就能把池耗光（见 #81 修复）。
+    #   pool_recycle=1800       连接活到 30 分钟强制回收
+    #   pool_timeout=30         拿不到连接最多等 30s
     _engine_kwargs.update(
         pool_pre_ping=True,
-        pool_size=10,
-        max_overflow=20,
+        pool_size=5,
+        max_overflow=3,
         pool_recycle=1800,
         pool_timeout=30,
     )
