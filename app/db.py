@@ -23,13 +23,17 @@ _settings = get_settings()
 _engine_kwargs: dict = {"echo": False}
 if not _settings.is_sqlite:
     # 连接池调优（Gunicorn 24 workers，PG max_connections=300）：
-    #   每 worker: pool_size=5 + max_overflow=5 = 上限 10
-    #   24 workers × 10 = 240，留 60 给 psql/监控/探针
-    #   代理服务 DB 操作轻量（查 key → 转发 → 写日志），连接占用时间短
+    #
+    # 本服务是 IO 密集型代理，DB 操作极轻（查 key ~2ms → 转发等上游 → 写日志 ~3ms）。
+    # 每请求同一时刻只占 1 个连接，长时间等上游期间不持连接。
+    #
+    # pool_size=2: 每 worker 常驻 2 个连接（API + 后台任务），24×2=48 空闲连接
+    # max_overflow=8: 峰值（探针风暴）再临时开 8 个，24×10=240 < PG 300
+    # 溢出连接空闲后自动回收，不浪费资源
     _engine_kwargs.update(
         pool_pre_ping=True,
-        pool_size=5,
-        max_overflow=5,
+        pool_size=2,
+        max_overflow=8,
         pool_recycle=1800,
         pool_timeout=30,
     )
