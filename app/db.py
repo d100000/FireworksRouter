@@ -28,7 +28,7 @@ if not _settings.is_sqlite:
     # 每请求同一时刻只占 1 个连接，长时间等上游期间不持连接。
     #
     # pool_size=2: 每 worker 常驻 2 个连接（API + 后台任务），24×2=48 空闲连接
-    # max_overflow=8: 峰值（探针风暴）再临时开 8 个，24×10=240 < PG 300
+    # max_overflow=8: 峰值（探针风暴）再临时开 8 个，24×10=240 < PG 500
     # 溢出连接空闲后自动回收，不浪费资源
     _engine_kwargs.update(
         pool_pre_ping=True,
